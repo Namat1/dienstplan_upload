@@ -123,167 +123,28 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
     return html
 
 css_styles = """
-body {
-  margin: 0;
-  padding: 0;
-  background: #f5f7fa;
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-  color: #1d1d1f;
-  font-size: 14px;
-}
-
-.container-outer {
-  max-width: 500px;
-  margin: 20px auto;
-  padding: 0 12px;
-}
-
-.headline-block {
-  text-align: center;
-  margin-bottom: 16px;
-}
-
-.headline-kw-box {
-  background: #eef2f9;
-  border-radius: 12px;
-  padding: 8px 14px;
-  border: 2px solid #a8b4cc;
-  box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-}
-
-.headline-kw {
-  font-size: 1.3rem;
-  font-weight: 700;
-  color: #1b3a7a;
-  margin-bottom: 2px;
-}
-
-.headline-period {
-  font-size: 0.85rem;
-  color: #3e567f;
-}
-
-.headline-name {
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: #1a3662;
-  margin-top: 2px;
-}
-
-.daycard {
-  background: #ffffff;
-  border-radius: 12px;
-  padding: 8px 12px;
-  margin-bottom: 12px;
-  border: 1.5px solid #b4bcc9;
-  box-shadow: 0 2px 5px rgba(0,0,0,0.06);
-  transition: box-shadow 0.2s;
-}
-
-.daycard:hover {
-  box-shadow: 0 3px 10px rgba(0,0,0,0.1);
-}
-
-.daycard.samstag,
-.daycard.sonntag {
-  background: #fff3cc;
-  border: 1.5px solid #e5aa00;
-  box-shadow: inset 0 0 0 3px #ffd566, 0 3px 8px rgba(0, 0, 0, 0.06);
-  border-radius: 12px;
-  overflow: hidden;
-}
-
-.daycard.samstag .header-row,
-.daycard.sonntag .header-row {
-  background: #ffedb0;
-  padding: 4px 0;
-  margin-bottom: 6px;
-  border-bottom: 1px solid #e5aa00;
-}
-
-.daycard.samstag .prominent-date,
-.daycard.sonntag .prominent-date {
-  color: #8c5a00;
-  font-weight: 700;
-}
-
-.daycard.samstag .weekday,
-.daycard.sonntag .weekday {
-  color: #7a4e00;
-  font-weight: 700;
-}
-
-.header-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: nowrap;
-  font-weight: 600;
-  font-size: 0.9rem;
-  color: #2a2a2a;
-  padding: 4px 0;
-  margin-bottom: 6px;
-}
-
-.weekday {
-  color: #5e8f64;
-  font-weight: 600;
-  margin-left: 8px;
-}
-
-.prominent-date {
-  color: #bb4444;
-  font-weight: 600;
-}
-
-.info {
-  display: flex;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  font-size: 0.85rem;
-  padding-top: 4px;
-}
-
-.info-block {
-  flex: 1 1 48%;
-  background: #f4f6fb;
-  padding: 4px 6px;
-  border-radius: 6px;
-  border: 1px solid #9ca7bc;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-direction: row;
-  gap: 6px;
-}
-
-.label {
-  font-weight: 600;
-  color: #555;
-  font-size: 0.8rem;
-  margin-bottom: 0;
-}
-
-.value {
-  font-weight: 600;
-  color: #222;
-  font-size: 0.85rem;
-}
-
-@media (max-width: 440px) {
-  .header-row {
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 4px;
-  }
-  .info {
-    flex-direction: column;
-  }
-}
+body { margin: 0; padding: 0; background: #f5f7fa; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; color: #1d1d1f; font-size: 14px; }
+.container-outer { max-width: 500px; margin: 20px auto; padding: 0 12px; }
+.headline-block { text-align: center; margin-bottom: 16px; }
+.headline-kw-box { background: #eef2f9; border-radius: 12px; padding: 8px 14px; border: 2px solid #a8b4cc; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
+.headline-kw { font-size: 1.3rem; font-weight: 700; color: #1b3a7a; margin-bottom: 2px; }
+.headline-period { font-size: 0.85rem; color: #3e567f; }
+.headline-name { font-size: 0.95rem; font-weight: 600; color: #1a3662; margin-top: 2px; }
+.daycard { background: #ffffff; border-radius: 12px; padding: 8px 12px; margin-bottom: 12px; border: 1.5px solid #b4bcc9; box-shadow: 0 2px 5px rgba(0,0,0,0.06); transition: box-shadow 0.2s; }
+.daycard:hover { box-shadow: 0 3px 10px rgba(0,0,0,0.1); }
+.daycard.samstag, .daycard.sonntag { background: #fff3cc; border: 1.5px solid #e5aa00; box-shadow: inset 0 0 0 3px #ffd566, 0 3px 8px rgba(0, 0, 0, 0.06); border-radius: 12px; overflow: hidden; }
+.daycard.samstag .header-row, .daycard.sonntag .header-row { background: #ffedb0; padding: 4px 0; margin-bottom: 6px; border-bottom: 1px solid #e5aa00; }
+.daycard.samstag .prominent-date, .daycard.sonntag .prominent-date { color: #8c5a00; font-weight: 700; }
+.daycard.samstag .weekday, .daycard.sonntag .weekday { color: #7a4e00; font-weight: 700; }
+.header-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: nowrap; font-weight: 600; font-size: 0.9rem; color: #2a2a2a; padding: 4px 0; margin-bottom: 6px; }
+.weekday { color: #5e8f64; font-weight: 600; margin-left: 8px; }
+.prominent-date { color: #bb4444; font-weight: 600; }
+.info { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 0.85rem; padding-top: 4px; }
+.info-block { flex: 1 1 48%; background: #f4f6fb; padding: 4px 6px; border-radius: 6px; border: 1px solid #9ca7bc; display: flex; justify-content: space-between; align-items: center; flex-direction: row; gap: 6px; }
+.label { font-weight: 600; color: #555; font-size: 0.8rem; margin-bottom: 0; }
+.value { font-weight: 600; color: #222; font-size: 0.85rem; }
+@media (max-width: 440px) { .header-row { flex-direction: row; flex-wrap: wrap; gap: 4px; } .info { flex-direction: column; } }
 """
-
-# Der restliche Code (Excel-Verarbeitung + generate_html-Aufruf) bleibt wie gehabt und verwendet jetzt das neue Design.
 
 
 # Streamlit UI für Mehrfach-Upload
@@ -303,18 +164,42 @@ if uploaded_files:
                 for file in uploaded_files:
                     df = pd.read_excel(file, sheet_name="Touren", skiprows=4, engine="openpyxl")
 
-                    fahrer_dict = {}
-                    for _, row in df.iterrows():
-                        datum = row.iloc[14]
-                        tour = row.iloc[15]
-                        uhrzeit = row.iloc[8]
+                    # 1. Globales Datum & KW für die gesamte Datei ermitteln (als Fallback für leere Fahrer)
+                    valid_dates = pd.to_datetime(df.iloc[:, 14], errors="coerce").dropna()
+                    if not valid_dates.empty:
+                        global_start = valid_dates.min().date()
+                    else:
+                        global_start = pd.Timestamp.today().date()
+                    
+                    global_start_sonntag = global_start - pd.Timedelta(days=(global_start.weekday() + 1) % 7)
+                    global_kw = get_kw(global_start_sonntag) + 1
 
+                    fahrer_dict = {}
+                    
+                    for _, row in df.iterrows():
+                        # A) Alle Fahrer aus dieser Zeile auslesen (auch wenn kein Datum/Tour vorhanden ist)
+                        aktuelle_fahrer = []
+                        for pos in [(3, 4), (6, 7)]:
+                            nachname = str(row.iloc[pos[0]]).strip().title() if pd.notna(row.iloc[pos[0]]) else ""
+                            vorname = str(row.iloc[pos[1]]).strip().title() if pd.notna(row.iloc[pos[1]]) else ""
+                            if nachname or vorname:
+                                fahrer_name = f"{nachname}, {vorname}"
+                                aktuelle_fahrer.append(fahrer_name)
+                                if fahrer_name not in fahrer_dict:
+                                    fahrer_dict[fahrer_name] = {}
+                        
+                        # B) Datum und Tour verarbeiten (nur, wenn vorhanden)
+                        datum = row.iloc[14]
                         if pd.isna(datum):
                             continue
+                            
                         try:
                             datum_dt = pd.to_datetime(datum)
                         except:
                             continue
+
+                        tour = row.iloc[15]
+                        uhrzeit = row.iloc[8]
 
                         if pd.isna(uhrzeit):
                             uhrzeit_str = "–"
@@ -333,25 +218,24 @@ if uploaded_files:
 
                         eintrag_text = f"{uhrzeit_str} – {str(tour).strip()}"
 
-                        for pos in [(3, 4), (6, 7)]:
-                            nachname = str(row.iloc[pos[0]]).strip().title() if pd.notna(row.iloc[pos[0]]) else ""
-                            vorname = str(row.iloc[pos[1]]).strip().title() if pd.notna(row.iloc[pos[1]]) else ""
-                            if nachname or vorname:
-                                fahrer_name = f"{nachname}, {vorname}"
-                                if fahrer_name not in fahrer_dict:
-                                    fahrer_dict[fahrer_name] = {}
-                                if datum_dt.date() not in fahrer_dict[fahrer_name]:
-                                    fahrer_dict[fahrer_name][datum_dt.date()] = []
-                                if eintrag_text not in fahrer_dict[fahrer_name][datum_dt.date()]:
-                                    fahrer_dict[fahrer_name][datum_dt.date()].append(eintrag_text)
+                        # Eintrag bei den erfassten Fahrern der Zeile hinterlegen
+                        for fahrer_name in aktuelle_fahrer:
+                            if datum_dt.date() not in fahrer_dict[fahrer_name]:
+                                fahrer_dict[fahrer_name][datum_dt.date()] = []
+                            if eintrag_text not in fahrer_dict[fahrer_name][datum_dt.date()]:
+                                fahrer_dict[fahrer_name][datum_dt.date()].append(eintrag_text)
 
+                    # C) HTML für ALLE Fahrer generieren (auch für die ohne Einträge)
                     for fahrer_name, eintraege in fahrer_dict.items():
+                        
+                        # Fallback auf die globale Kalenderwoche der Excel-Datei, wenn Fahrer leer ist
                         if not eintraege:
-                            continue
-
-                        start_datum = min(eintraege.keys())
-                        start_sonntag = start_datum - pd.Timedelta(days=(start_datum.weekday() + 1) % 7)
-                        kw = get_kw(start_sonntag) + 1
+                            start_sonntag = global_start_sonntag
+                            kw = global_kw
+                        else:
+                            start_datum = min(eintraege.keys())
+                            start_sonntag = start_datum - pd.Timedelta(days=(start_datum.weekday() + 1) % 7)
+                            kw = get_kw(start_sonntag) + 1
 
                         wochen_eintraege = []
                         for i in range(7):
@@ -383,8 +267,6 @@ if uploaded_files:
                         v_clean = vorname.strip().lower()
                         filename_part = sonder_dateien.get((n_clean, v_clean), nachname.replace(" ", "_"))
                         filename = f"KW{kw:02d}_{filename_part}.html"
-
-                        
 
                         html_code = generate_html(fahrer_name, wochen_eintraege, kw, start_sonntag, css_styles)
 
