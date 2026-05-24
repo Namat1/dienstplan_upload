@@ -135,7 +135,7 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
 
     <div class="hero-main">
       <div class="hero-kw">
-        <span class="hero-kw-label">Kalenderwoche</span>
+        <span class="hero-kw-label">Woche</span>
         <span class="hero-kw-number">{kw:02d}</span>
       </div>
 
@@ -545,14 +545,18 @@ body {
   }
 
   .hero-main {
-    grid-template-columns: 68px 1fr;
+    grid-template-columns: 74px 1fr;
     gap: 10px;
   }
 
   .hero-kw {
-    width: 68px;
+    width: 74px;
     min-height: 64px;
     border-radius: 14px;
+  }
+
+  .hero-kw-label {
+    font-size: .54rem;
   }
 
   .hero-kw-number {
