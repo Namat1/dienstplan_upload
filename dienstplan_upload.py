@@ -115,6 +115,8 @@ def parse_tour(tour):
     return tour_str
 
 def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
+    period_end = start_date + pd.Timedelta(days=6)
+
     html = f"""<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -125,13 +127,26 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
 </head>
 <body>
 <div class="container-outer">
-  <div class="headline-block">
-    <div class="headline-kw-box">
-      <div class="headline-kw">KW {kw:02d}</div>
-      <div class="headline-period">{start_date.strftime('%d.%m.%Y')} – {(start_date + pd.Timedelta(days=6)).strftime('%d.%m.%Y')}</div>
-      <div class="headline-name">{fahrer_name}</div>
+  <header class="plan-hero">
+    <div class="hero-topline">
+      <span class="hero-dot"></span>
+      <span>Dienstplan</span>
     </div>
-  </div>"""
+
+    <div class="hero-main">
+      <div class="hero-kw">
+        <span class="hero-kw-label">Kalenderwoche</span>
+        <span class="hero-kw-number">{kw:02d}</span>
+      </div>
+
+      <div class="hero-meta">
+        <div class="headline-name">{fahrer_name}</div>
+        <div class="headline-period">{start_date.strftime('%d.%m.%Y')} – {period_end.strftime('%d.%m.%Y')}</div>
+      </div>
+    </div>
+  </header>
+
+  <main class="week-list">"""
 
     for eintrag in eintraege:
         date_text, content = eintrag.split(": ", 1)
@@ -149,195 +164,445 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
             tour = "–"
 
         card_class = "daycard"
+        badge_text = "Dienst"
+        icon = "🚚"
+
+        content_check = f"{uhrzeit} {tour}".lower()
         if weekday == "Samstag":
             card_class += " samstag"
+            badge_text = "Samstag"
         elif weekday == "Sonntag":
             card_class += " sonntag"
+            badge_text = "Sonntag"
+
+        if tour == "–" and uhrzeit == "–":
+            card_class += " leer"
+            badge_text = "Kein Eintrag"
+            icon = "—"
+        elif "urlaub" in content_check:
+            card_class += " frei"
+            badge_text = "Urlaub"
+            icon = "☀️"
+        elif "frei" in content_check:
+            card_class += " frei"
+            badge_text = "Frei"
+            icon = "🕊️"
+        elif "ausgleich" in content_check:
+            card_class += " frei"
+            badge_text = "Ausgleich"
+            icon = "🛌"
+        elif "krank" in content_check:
+            card_class += " krank"
+            badge_text = "Krank"
+            icon = "💊"
 
         html += f"""
-  <div class="{card_class}">
-    <div class="header-row">
-      <div class="prominent-date">{date_obj.strftime('%d.%m.%Y')}</div>
-      <div class="weekday">{weekday}</div>
-    </div>
-    <div class="info">
-      <div class="info-block">
-        <span class="label">Tour / Aufgabe:</span>
-        <span class="value">{tour}</span>
+    <section class="{card_class}">
+      <div class="day-top">
+        <div class="day-date">
+          <div class="weekday">{weekday}</div>
+          <div class="prominent-date">{date_obj.strftime('%d.%m.%Y')}</div>
+        </div>
+        <div class="day-badge"><span>{icon}</span>{badge_text}</div>
       </div>
-      <div class="info-block">
-        <span class="label">Uhrzeit:</span>
-        <span class="value">{uhrzeit}</span>
+
+      <div class="info">
+        <div class="info-block tour-block">
+          <span class="label">Tour / Aufgabe:</span>
+          <span class="value">{tour}</span>
+        </div>
+        <div class="info-block time-block">
+          <span class="label">Uhrzeit:</span>
+          <span class="value">{uhrzeit}</span>
+        </div>
       </div>
-    </div>
-  </div>"""
+    </section>"""
 
     html += """
+  </main>
 </div>
 </body>
 </html>"""
     return html
 
+
 css_styles = """
+:root {
+  --bg-main: #e6eef7;
+  --card: #ffffff;
+  --border: #d7e0ec;
+  --border-strong: #b8c6d8;
+  --text: #0f172a;
+  --muted: #64748b;
+  --soft: #f8fafc;
+  --soft-blue: #eef6ff;
+  --blue: #1b66b3;
+  --blue-dark: #1b3a7a;
+  --green: #15803d;
+  --green-soft: #ecfdf3;
+  --yellow: #b45309;
+  --yellow-soft: #fffbeb;
+  --red: #b91c1c;
+  --red-soft: #fff1f2;
+  --shadow: 0 10px 24px rgba(15, 23, 42, .08);
+  --shadow-soft: 0 2px 8px rgba(15, 23, 42, .06);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
   margin: 0;
   padding: 0;
-  background: #f5f7fa;
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-  color: #1d1d1f;
-  font-size: 14px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(27, 102, 179, .10), transparent 32rem),
+    var(--bg-main);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.45;
 }
 
 .container-outer {
-  max-width: 500px;
-  margin: 20px auto;
-  padding: 0 12px;
+  width: min(560px, calc(100vw - 24px));
+  margin: 16px auto 22px;
 }
 
-.headline-block {
-  text-align: center;
-  margin-bottom: 16px;
+.plan-hero {
+  background: linear-gradient(135deg, #ffffff 0%, #eef6ff 100%);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 14px;
+  box-shadow: var(--shadow);
+  margin-bottom: 10px;
+  overflow: hidden;
+  position: relative;
 }
 
-.headline-kw-box {
-  background: #eef2f9;
-  border-radius: 12px;
-  padding: 8px 14px;
-  border: 2px solid #a8b4cc;
-  box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+.plan-hero::after {
+  content: "";
+  position: absolute;
+  width: 90px;
+  height: 90px;
+  right: -34px;
+  top: -36px;
+  border-radius: 999px;
+  background: rgba(27, 102, 179, .12);
 }
 
-.headline-kw {
-  font-size: 1.3rem;
-  font-weight: 700;
-  color: #1b3a7a;
-  margin-bottom: 2px;
+.hero-topline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: .70rem;
+  font-weight: 800;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--blue-dark);
+  background: rgba(27, 102, 179, .08);
+  border: 1px solid rgba(27, 102, 179, .12);
+  border-radius: 999px;
+  padding: 4px 9px;
+  margin-bottom: 10px;
+  position: relative;
+  z-index: 1;
 }
 
-.headline-period {
-  font-size: 0.85rem;
-  color: #3e567f;
+.hero-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--blue);
+  display: inline-block;
+}
+
+.hero-main {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: center;
+  position: relative;
+  z-index: 1;
+}
+
+.hero-kw {
+  width: 76px;
+  min-height: 70px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, var(--blue), var(--blue-dark));
+  color: #ffffff;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  box-shadow: 0 8px 18px rgba(27, 102, 179, .25);
+}
+
+.hero-kw-label {
+  font-size: .52rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  opacity: .78;
+}
+
+.hero-kw-number {
+  font-size: 1.85rem;
+  line-height: 1;
+  font-weight: 900;
+  letter-spacing: -.03em;
+}
+
+.hero-meta {
+  min-width: 0;
 }
 
 .headline-name {
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: #1a3662;
-  margin-top: 2px;
+  font-size: 1.08rem;
+  line-height: 1.15;
+  font-weight: 900;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.headline-period {
+  margin-top: 4px;
+  font-size: .82rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.week-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .daycard {
-  background: #ffffff;
-  border-radius: 12px;
-  padding: 8px 12px;
-  margin-bottom: 12px;
-  border: 1.5px solid #b4bcc9;
-  box-shadow: 0 2px 5px rgba(0,0,0,0.06);
-  transition: box-shadow 0.2s;
+  background: rgba(255,255,255,.92);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 10px;
+  box-shadow: var(--shadow-soft);
+  transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
 }
 
 .daycard:hover {
-  box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, .10);
+  border-color: var(--border-strong);
+}
+
+.day-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.day-date {
+  min-width: 0;
+}
+
+.weekday {
+  font-size: .78rem;
+  font-weight: 900;
+  color: var(--blue-dark);
+  line-height: 1.1;
+}
+
+.prominent-date {
+  font-size: .72rem;
+  color: var(--muted);
+  font-weight: 700;
+  margin-top: 2px;
+}
+
+.day-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  font-size: .66rem;
+  font-weight: 900;
+  color: var(--blue-dark);
+  background: var(--soft-blue);
+  border: 1px solid #dbeafe;
+  border-radius: 999px;
+  padding: 4px 8px;
+}
+
+.info {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 118px;
+  gap: 7px;
+}
+
+.info-block {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--soft);
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 8px 9px;
+}
+
+.label {
+  color: #94a3b8;
+  font-size: .58rem;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: .045em;
+  white-space: nowrap;
+}
+
+.value {
+  color: var(--text);
+  font-size: .88rem;
+  font-weight: 900;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.time-block .value {
+  white-space: nowrap;
 }
 
 .daycard.samstag,
 .daycard.sonntag {
-  background: #fff3cc;
-  border: 1.5px solid #e5aa00;
-  box-shadow: inset 0 0 0 3px #ffd566, 0 3px 8px rgba(0, 0, 0, 0.06);
-  border-radius: 12px;
-  overflow: hidden;
+  background: linear-gradient(180deg, #ffffff, var(--yellow-soft));
+  border-color: #fde68a;
 }
 
-.daycard.samstag .header-row,
-.daycard.sonntag .header-row {
-  background: #ffedb0;
-  padding: 4px 0;
-  margin-bottom: 6px;
-  border-bottom: 1px solid #e5aa00;
-}
-
-.daycard.samstag .prominent-date,
-.daycard.sonntag .prominent-date {
-  color: #8c5a00;
-  font-weight: 700;
+.daycard.samstag .day-badge,
+.daycard.sonntag .day-badge {
+  color: var(--yellow);
+  background: #fef3c7;
+  border-color: #fde68a;
 }
 
 .daycard.samstag .weekday,
 .daycard.sonntag .weekday {
-  color: #7a4e00;
-  font-weight: 700;
+  color: var(--yellow);
 }
 
-.header-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: nowrap;
-  font-weight: 600;
-  font-size: 0.9rem;
-  color: #2a2a2a;
-  padding: 4px 0;
-  margin-bottom: 6px;
+.daycard.frei {
+  background: linear-gradient(180deg, #ffffff, var(--green-soft));
+  border-color: #bbf7d0;
 }
 
-.weekday {
-  color: #5e8f64;
-  font-weight: 600;
-  margin-left: 8px;
+.daycard.frei .day-badge {
+  color: var(--green);
+  background: #dcfce7;
+  border-color: #bbf7d0;
 }
 
-.prominent-date {
-  color: #bb4444;
-  font-weight: 600;
+.daycard.frei .weekday {
+  color: var(--green);
 }
 
-.info {
-  display: flex;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  font-size: 0.85rem;
-  padding-top: 4px;
+.daycard.krank {
+  background: linear-gradient(180deg, #ffffff, var(--red-soft));
+  border-color: #fecdd3;
 }
 
-.info-block {
-  flex: 1 1 48%;
-  background: #f4f6fb;
-  padding: 4px 6px;
-  border-radius: 6px;
-  border: 1px solid #9ca7bc;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-direction: row;
-  gap: 6px;
+.daycard.krank .day-badge {
+  color: var(--red);
+  background: #ffe4e6;
+  border-color: #fecdd3;
 }
 
-.label {
-  font-weight: 600;
-  color: #555;
-  font-size: 0.8rem;
-  margin-bottom: 0;
+.daycard.krank .weekday {
+  color: var(--red);
 }
 
-.value {
-  font-weight: 600;
-  color: #222;
-  font-size: 0.85rem;
+.daycard.leer {
+  opacity: .78;
+}
+
+.daycard.leer .value {
+  color: #94a3b8;
 }
 
 @media (max-width: 440px) {
-  .header-row {
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 4px;
+  .container-outer {
+    width: min(100vw - 16px, 560px);
+    margin-top: 8px;
   }
+
+  .plan-hero {
+    border-radius: 16px;
+    padding: 12px;
+  }
+
+  .hero-main {
+    grid-template-columns: 68px 1fr;
+    gap: 10px;
+  }
+
+  .hero-kw {
+    width: 68px;
+    min-height: 64px;
+    border-radius: 14px;
+  }
+
+  .hero-kw-number {
+    font-size: 1.65rem;
+  }
+
+  .headline-name {
+    font-size: 1rem;
+  }
+
+  .headline-period {
+    font-size: .76rem;
+  }
+
+  .daycard {
+    border-radius: 14px;
+    padding: 9px;
+  }
+
   .info {
-    flex-direction: column;
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .info-block {
+    padding: 7px 8px;
+  }
+
+  .time-block .value {
+    white-space: normal;
+  }
+}
+
+@media print {
+  body {
+    background: #ffffff;
+  }
+
+  .container-outer {
+    width: 100%;
+    margin: 0;
+  }
+
+  .plan-hero,
+  .daycard {
+    box-shadow: none;
   }
 }
 """
+
 
 st.set_page_config(page_title="Touren-Export", layout="centered")
 st.title("Dienstplan aktualisieren")
