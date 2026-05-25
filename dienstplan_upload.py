@@ -121,7 +121,7 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
 <html lang="de">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>KW{kw:02d} – {fahrer_name}</title>
   <style>{css_styles}</style>
 </head>
@@ -221,6 +221,29 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
     html += """
   </main>
 </div>
+<script>
+(function () {
+  function fixBrowserBarSpace() {
+    document.documentElement.style.minHeight = window.innerHeight + "px";
+    document.body.style.minHeight = window.innerHeight + "px";
+  }
+
+  window.addEventListener("load", function () {
+    fixBrowserBarSpace();
+
+    setTimeout(function () {
+      fixBrowserBarSpace();
+      window.scrollTo(0, 1);
+      window.scrollTo(0, 0);
+    }, 250);
+  });
+
+  window.addEventListener("resize", fixBrowserBarSpace);
+  window.addEventListener("orientationchange", function () {
+    setTimeout(fixBrowserBarSpace, 300);
+  });
+})();
+</script>
 </body>
 </html>"""
     return html
@@ -254,12 +277,17 @@ css_styles = """
 
 html {
   -webkit-text-size-adjust: 100%;
+  min-height: 100%;
+  min-height: 100dvh;
+  background: var(--bg-main);
 }
 
 body {
   margin: 0;
-  padding: 0;
-  min-height: 100vh;
+  padding: 0 0 calc(150px + env(safe-area-inset-bottom));
+  min-height: 100%;
+  min-height: 100dvh;
+  overflow-x: hidden;
   background:
     radial-gradient(circle at top left, rgba(27, 102, 179, .10), transparent 32rem),
     var(--bg-main);
@@ -271,7 +299,8 @@ body {
 
 .container-outer {
   width: min(560px, calc(100vw - 24px));
-  margin: 16px auto 22px;
+  margin: 16px auto calc(150px + env(safe-area-inset-bottom));
+  padding-bottom: env(safe-area-inset-bottom);
 }
 
 .plan-hero {
