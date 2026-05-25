@@ -221,27 +221,48 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
     html += """
   </main>
 </div>
+<div class="browser-safe-spacer" aria-hidden="true"></div>
 <script>
 (function () {
-  function fixBrowserBarSpace() {
-    document.documentElement.style.minHeight = window.innerHeight + "px";
-    document.body.style.minHeight = window.innerHeight + "px";
+  function setBrowserGap() {
+    var vv = window.visualViewport;
+    var gap = 0;
+
+    if (vv) {
+      gap = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    }
+
+    document.documentElement.style.setProperty("--browser-bottom-gap", Math.ceil(gap) + "px");
+  }
+
+  function nudgeViewport() {
+    setBrowserGap();
+
+    // Wichtig: nicht wieder auf 0 zurueckscrollen.
+    // 1px reicht oft, damit Safari/Chrome die untere Browserleiste korrekt einrechnen.
+    if (window.scrollY === 0 && document.documentElement.scrollHeight > window.innerHeight + 1) {
+      window.scrollTo(0, 1);
+    }
+  }
+
+  setBrowserGap();
+
+  window.addEventListener("resize", setBrowserGap, { passive: true });
+  window.addEventListener("orientationchange", function () {
+    setTimeout(setBrowserGap, 250);
+    setTimeout(nudgeViewport, 450);
+  }, { passive: true });
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", setBrowserGap, { passive: true });
+    window.visualViewport.addEventListener("scroll", setBrowserGap, { passive: true });
   }
 
   window.addEventListener("load", function () {
-    fixBrowserBarSpace();
-
-    setTimeout(function () {
-      fixBrowserBarSpace();
-      window.scrollTo(0, 1);
-      window.scrollTo(0, 0);
-    }, 250);
-  });
-
-  window.addEventListener("resize", fixBrowserBarSpace);
-  window.addEventListener("orientationchange", function () {
-    setTimeout(fixBrowserBarSpace, 300);
-  });
+    setTimeout(nudgeViewport, 80);
+    setTimeout(nudgeViewport, 350);
+    setTimeout(nudgeViewport, 800);
+  }, { passive: true });
 })();
 </script>
 </body>
@@ -278,16 +299,19 @@ css_styles = """
 html {
   -webkit-text-size-adjust: 100%;
   min-height: 100%;
+  min-height: -webkit-fill-available;
+  min-height: 100svh;
   min-height: 100dvh;
-  background: var(--bg-main);
 }
 
 body {
   margin: 0;
-  padding: 0 0 calc(150px + env(safe-area-inset-bottom));
+  padding: 0;
   min-height: 100%;
-  min-height: 100dvh;
-  overflow-x: hidden;
+  min-height: -webkit-fill-available;
+  min-height: calc(100svh + 2px);
+  min-height: calc(100dvh + 2px);
+  padding-bottom: calc(150px + env(safe-area-inset-bottom) + var(--browser-bottom-gap, 0px));
   background:
     radial-gradient(circle at top left, rgba(27, 102, 179, .10), transparent 32rem),
     var(--bg-main);
@@ -295,12 +319,18 @@ body {
   color: var(--text);
   font-size: 15px;
   line-height: 1.45;
+  overflow-x: hidden;
 }
 
 .container-outer {
   width: min(560px, calc(100vw - 24px));
-  margin: 16px auto calc(150px + env(safe-area-inset-bottom));
-  padding-bottom: env(safe-area-inset-bottom);
+  margin: 16px auto 0;
+  padding-bottom: calc(80px + env(safe-area-inset-bottom) + var(--browser-bottom-gap, 0px));
+}
+
+.browser-safe-spacer {
+  height: calc(140px + env(safe-area-inset-bottom) + var(--browser-bottom-gap, 0px));
+  pointer-events: none;
 }
 
 .plan-hero {
@@ -566,6 +596,7 @@ body {
   .container-outer {
     width: min(100vw - 16px, 560px);
     margin-top: 8px;
+    margin-bottom: 0;
   }
 
   .plan-hero {
@@ -647,6 +678,11 @@ body {
   .container-outer {
     width: 100%;
     margin: 0;
+    padding-bottom: 0;
+  }
+
+  .browser-safe-spacer {
+    display: none;
   }
 
   .plan-hero,
