@@ -576,13 +576,33 @@ body {
     padding: 9px;
   }
 
+  /* Handy: Tour und Uhrzeit bleiben nebeneinander, solange genug Platz ist. */
   .info {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr) 92px;
     gap: 6px;
   }
 
   .info-block {
-    padding: 7px 8px;
+    padding: 7px 7px;
+  }
+
+  .label {
+    font-size: .50rem;
+    letter-spacing: .025em;
+  }
+
+  .value {
+    font-size: .80rem;
+  }
+
+  .time-block .value {
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 340px) {
+  .info {
+    grid-template-columns: 1fr;
   }
 
   .time-block .value {
