@@ -128,7 +128,7 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
 <body>
 <div class="container-outer">
   <div class="back-bar">
-    <a href="index.html" class="btn-back" onclick="if(document.referrer){{history.back();return false;}}">
+    <a href="plane.php" class="btn-back">
       <span class="btn-back-arrow" aria-hidden="true">‹</span>
       <span>Zurück</span>
     </a>
