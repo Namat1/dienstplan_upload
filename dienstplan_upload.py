@@ -127,6 +127,13 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
 </head>
 <body>
 <div class="container-outer">
+  <div class="back-bar">
+    <a href="index.html" class="btn-back" onclick="if(document.referrer){{history.back();return false;}}">
+      <span class="btn-back-arrow" aria-hidden="true">‹</span>
+      <span>Zurück</span>
+    </a>
+  </div>
+
   <header class="plan-hero">
     <div class="hero-topline">
       <span class="hero-dot"></span>
@@ -331,6 +338,48 @@ body {
 .browser-safe-spacer {
   height: calc(140px + env(safe-area-inset-bottom) + var(--browser-bottom-gap, 0px));
   pointer-events: none;
+}
+
+.back-bar {
+  margin-bottom: 10px;
+}
+
+.btn-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: .82rem;
+  font-weight: 700;
+  text-decoration: none;
+  color: var(--blue-dark);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 14px 7px 11px;
+  box-shadow: var(--shadow-soft);
+  -webkit-tap-highlight-color: transparent;
+  transition: background .15s ease, border-color .15s ease, transform .05s ease;
+}
+
+.btn-back:hover {
+  background: var(--soft-blue);
+  border-color: var(--border-strong);
+}
+
+.btn-back:active {
+  transform: scale(.97);
+}
+
+.btn-back-arrow {
+  font-size: 1.15rem;
+  line-height: 1;
+  margin-top: -1px;
+}
+
+@media print {
+  .back-bar {
+    display: none;
+  }
 }
 
 .plan-hero {
