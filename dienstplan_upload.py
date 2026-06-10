@@ -128,7 +128,7 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
 <body>
 <div class="container-outer">
   <div class="back-bar">
-    <a href="../../../../plane.php" class="btn-back" onclick="var t=setTimeout(function(){{location.href='../../../../plane.php';}},500);addEventListener('pagehide',function(){{clearTimeout(t);}});history.back();return false;">
+    <a href="../../../../plane.php" class="btn-back" id="btnBack">
       <span class="btn-back-arrow" aria-hidden="true">‹</span>
       <span>Zurück</span>
     </a>
@@ -229,49 +229,7 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
   </main>
 </div>
 <div class="browser-safe-spacer" aria-hidden="true"></div>
-<script>
-(function () {
-  function setBrowserGap() {
-    var vv = window.visualViewport;
-    var gap = 0;
-
-    if (vv) {
-      gap = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-    }
-
-    document.documentElement.style.setProperty("--browser-bottom-gap", Math.ceil(gap) + "px");
-  }
-
-  function nudgeViewport() {
-    setBrowserGap();
-
-    // Wichtig: nicht wieder auf 0 zurueckscrollen.
-    // 1px reicht oft, damit Safari/Chrome die untere Browserleiste korrekt einrechnen.
-    if (window.scrollY === 0 && document.documentElement.scrollHeight > window.innerHeight + 1) {
-      window.scrollTo(0, 1);
-    }
-  }
-
-  setBrowserGap();
-
-  window.addEventListener("resize", setBrowserGap, { passive: true });
-  window.addEventListener("orientationchange", function () {
-    setTimeout(setBrowserGap, 250);
-    setTimeout(nudgeViewport, 450);
-  }, { passive: true });
-
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener("resize", setBrowserGap, { passive: true });
-    window.visualViewport.addEventListener("scroll", setBrowserGap, { passive: true });
-  }
-
-  window.addEventListener("load", function () {
-    setTimeout(nudgeViewport, 80);
-    setTimeout(nudgeViewport, 350);
-    setTimeout(nudgeViewport, 800);
-  }, { passive: true });
-})();
-</script>
+<script src="../../../../dienstplan.js"></script>
 </body>
 </html>"""
     return html
