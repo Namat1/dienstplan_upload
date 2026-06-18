@@ -6,6 +6,8 @@ import tempfile
 import os
 import time
 import ftplib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
 
@@ -16,6 +18,7 @@ FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/")
 FTP_USE_TLS = os.getenv("FTP_TLS", "0") == "1"
+FTP_PARALLEL = int(os.getenv("FTP_PARALLEL", "6"))
 
 # Deutsche Wochentage
 wochentage_deutsch_map = {
@@ -31,11 +34,20 @@ wochentage_deutsch_map = {
 def get_kw(datum):
     return datum.isocalendar()[1]
 
+def _new_ftp():
+    """Eine frische, eingeloggte FTP(S)-Verbindung im Passive-Mode."""
+    ftp = FTP_TLS() if FTP_USE_TLS else FTP()
+    ftp.connect(FTP_HOST, 21, timeout=30)
+    ftp.login(FTP_USER, FTP_PASS)
+    if FTP_USE_TLS:
+        ftp.prot_p()
+    ftp.set_pasv(True)
+    return ftp
+
 def ensure_ftp_dirs(ftp, remote_dir, created_cache):
     remote_dir = remote_dir.replace("\\", "/")
     if remote_dir in created_cache:
-        return 0.0
-    elapsed = 0.0
+        return
     path_built = ""
     for part in remote_dir.split("/"):
         if not part:
@@ -43,16 +55,13 @@ def ensure_ftp_dirs(ftp, remote_dir, created_cache):
         path_built += "/" + part
         if path_built in created_cache:
             continue
-        t = time.perf_counter()
         try:
             ftp.mkd(path_built)
         except error_perm:
             # existiert schon (550) -> ok; alles andere ist ein echter Fehler
             pass
-        elapsed += time.perf_counter() - t
         created_cache.add(path_built)
     created_cache.add(remote_dir)
-    return elapsed
 
 def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
     # Dateien sammeln
@@ -69,91 +78,90 @@ def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
         st.warning("Keine Dateien zum Hochladen gefunden.")
         return
 
-    # nach Zielverzeichnis sortieren -> minimiert cwd-Wechsel
-    all_files.sort(key=lambda p: os.path.dirname(p[1]))
-
-    t0 = time.perf_counter()
-    ftp = FTP_TLS() if FTP_USE_TLS else FTP()
-    ftp.connect(FTP_HOST, 21, timeout=30)
-    ftp.login(FTP_USER, FTP_PASS)
-    if FTP_USE_TLS:
-        ftp.prot_p()
-    ftp.set_pasv(True)
-    t_connect = time.perf_counter() - t0
-
     progress_bar = st.progress(0)
     status_text = st.empty()
-    created_cache = set()
-    current_dir = None
-    uploaded = 0
+    t0 = time.perf_counter()
 
-    # Timing-Akkumulatoren
-    t_mkd = 0.0
-    t_cwd = 0.0
-    t_stor = 0.0
-    bytes_total = 0
-    slowest = []  # (sekunden, name, bytes)
-
+    # 1) Alle Zielverzeichnisse EINMAL vorab anlegen (eine Verbindung).
+    #    Danach müssen die Worker nur noch STOR machen, kein mkd.
+    status_text.info("Lege Verzeichnisse an ...")
+    setup = _new_ftp()
+    created = set()
     try:
-        for local_path, remote_path in all_files:
-            remote_dir = os.path.dirname(remote_path).replace("\\", "/")
-            t_mkd += ensure_ftp_dirs(ftp, remote_dir, created_cache)
+        for _, remote_path in all_files:
+            ensure_ftp_dirs(setup, os.path.dirname(remote_path), created)
+    finally:
+        try:
+            setup.quit()
+        except (*ftplib.all_errors, OSError):
+            setup.close()
 
-            # cwd nur wechseln, wenn sich das Verzeichnis ändert
-            if remote_dir != current_dir:
-                t = time.perf_counter()
-                ftp.cwd(remote_dir)
-                t_cwd += time.perf_counter() - t
-                current_dir = remote_dir
+    # 2) Dateien parallel hochladen. Jeder Worker-Thread hält seine eigene
+    #    FTP-Verbindung (thread-local) und nutzt sie für alle seine Dateien wieder.
+    tl = threading.local()
+    conns = []
+    conns_lock = threading.Lock()
 
-            size = os.path.getsize(local_path)
-            t = time.perf_counter()
-            with open(local_path, "rb") as f:
-                ftp.storbinary(f"STOR {os.path.basename(remote_path)}", f)
-            dt = time.perf_counter() - t
-            t_stor += dt
-            bytes_total += size
-            slowest.append((dt, os.path.basename(local_path), size))
+    def get_conn():
+        ftp = getattr(tl, "ftp", None)
+        if ftp is None:
+            ftp = _new_ftp()
+            tl.ftp = ftp
+            tl.cwd = None
+            with conns_lock:
+                conns.append(ftp)
+        return ftp
 
+    def upload_one(item):
+        local_path, remote_path = item
+        ftp = get_conn()
+        remote_dir = os.path.dirname(remote_path).replace("\\", "/")
+        # cwd pro Verbindung nur wechseln, wenn nötig
+        if tl.cwd != remote_dir:
+            ftp.cwd(remote_dir)
+            tl.cwd = remote_dir
+        with open(local_path, "rb") as f:
+            ftp.storbinary(f"STOR {os.path.basename(remote_path)}", f)
+
+    workers = max(1, min(FTP_PARALLEL, total))
+    uploaded = 0
+    errors = []
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(upload_one, it): it for it in all_files}
+        for fut in as_completed(futures):
+            local_path, remote_path = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                errors.append((os.path.basename(remote_path), str(e)))
             uploaded += 1
             progress_bar.progress(uploaded / total)
-            status_text.info(f"Hochgeladen: {uploaded}/{total} – {os.path.basename(local_path)}")
+            status_text.info(f"Hochgeladen: {uploaded}/{total}")
 
-        status_text.success(f"Alle {uploaded} Dateien erfolgreich hochgeladen.")
-
-        # --- Timing-Auswertung ---
-        gesamt = t_connect + t_mkd + t_cwd + t_stor
-        mb = bytes_total / (1024 * 1024)
-        durchsatz = mb / t_stor if t_stor > 0 else 0.0
-
-        def anteil(x):
-            return f"{(x / gesamt * 100):4.1f}%" if gesamt > 0 else "  –  "
-
-        report = (
-            f"Connect/Login   : {t_connect:6.2f}s  ({anteil(t_connect)})\n"
-            f"Verzeichnis mkd : {t_mkd:6.2f}s  ({anteil(t_mkd)})\n"
-            f"Wechsel cwd     : {t_cwd:6.2f}s  ({anteil(t_cwd)})\n"
-            f"Transfer stor   : {t_stor:6.2f}s  ({anteil(t_stor)})   "
-            f"{mb:.2f} MB @ {durchsatz:.2f} MB/s\n"
-            f"-----------------------------------------\n"
-            f"Summe gemessen  : {gesamt:6.2f}s  fuer {total} Dateien\n"
-            f"O pro Datei     : {gesamt / total:6.3f}s"
-        )
-        st.subheader("Upload-Timing")
-        st.code(report)
-
-        slowest.sort(reverse=True)
-        if slowest:
-            top = "\n".join(
-                f"{z:6.2f}s  {n}  ({b / 1024:.0f} KB)" for z, n, b in slowest[:5]
-            )
-            st.caption("Langsamste Einzeltransfers:")
-            st.code(top)
-    finally:
+    # 3) Alle Worker-Verbindungen schließen
+    for ftp in conns:
         try:
             ftp.quit()
         except (*ftplib.all_errors, OSError):
-            ftp.close()
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    dauer = time.perf_counter() - t0
+    ok = total - len(errors)
+    if errors:
+        status_text.warning(
+            f"{ok}/{total} hochgeladen, {len(errors)} Fehler "
+            f"in {dauer:.1f}s ({workers} parallele Verbindungen)."
+        )
+        st.code("\n".join(f"{n}: {e}" for n, e in errors[:10]))
+    else:
+        status_text.success(
+            f"Alle {total} Dateien in {dauer:.1f}s hochgeladen "
+            f"({workers} parallele Verbindungen, Ø {dauer / total:.2f}s/Datei)."
+        )
 
 def normalize_driver_name(nachname, vorname):
     nachname = str(nachname).strip().title() if pd.notna(nachname) else ""
