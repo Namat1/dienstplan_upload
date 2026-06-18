@@ -4,7 +4,8 @@ from zipfile import ZipFile
 from datetime import datetime
 import tempfile
 import os
-from ftplib import FTP
+import ftplib
+from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
 
 # .env laden
@@ -13,6 +14,7 @@ FTP_HOST = os.getenv("FTP_HOST")
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/")
+FTP_USE_TLS = os.getenv("FTP_TLS", "0") == "1"
 
 # Deutsche Wochentage
 wochentage_deutsch_map = {
@@ -28,24 +30,27 @@ wochentage_deutsch_map = {
 def get_kw(datum):
     return datum.isocalendar()[1]
 
-def ensure_ftp_dirs(ftp, remote_dir):
+def ensure_ftp_dirs(ftp, remote_dir, created_cache):
     remote_dir = remote_dir.replace("\\", "/")
-    parts = remote_dir.split("/")
+    if remote_dir in created_cache:
+        return
     path_built = ""
-
-    for part in parts:
-        if part:
-            path_built += "/" + part
-            try:
-                ftp.mkd(path_built)
-            except:
-                pass
+    for part in remote_dir.split("/"):
+        if not part:
+            continue
+        path_built += "/" + part
+        if path_built in created_cache:
+            continue
+        try:
+            ftp.mkd(path_built)
+        except error_perm:
+            # existiert schon (550) -> ok; alles andere ist ein echter Fehler
+            pass
+        created_cache.add(path_built)
+    created_cache.add(remote_dir)
 
 def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
-    ftp = FTP()
-    ftp.connect(FTP_HOST, 21)
-    ftp.login(FTP_USER, FTP_PASS)
-
+    # Dateien sammeln
     all_files = []
     for root, _, files in os.walk(local_dir):
         for file in files:
@@ -55,26 +60,49 @@ def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
             all_files.append((local_path, remote_path))
 
     total = len(all_files)
-    uploaded = 0
+    if total == 0:
+        st.warning("Keine Dateien zum Hochladen gefunden.")
+        return
+
+    # nach Zielverzeichnis sortieren -> minimiert cwd-Wechsel
+    all_files.sort(key=lambda p: os.path.dirname(p[1]))
+
+    ftp = FTP_TLS() if FTP_USE_TLS else FTP()
+    ftp.connect(FTP_HOST, 21, timeout=30)
+    ftp.login(FTP_USER, FTP_PASS)
+    if FTP_USE_TLS:
+        ftp.prot_p()
+    ftp.set_pasv(True)
 
     progress_bar = st.progress(0)
     status_text = st.empty()
+    created_cache = set()
+    current_dir = None
+    uploaded = 0
 
-    for local_path, remote_path in all_files:
-        remote_dir = os.path.dirname(remote_path).replace("\\", "/")
-        ensure_ftp_dirs(ftp, remote_dir)
+    try:
+        for local_path, remote_path in all_files:
+            remote_dir = os.path.dirname(remote_path).replace("\\", "/")
+            ensure_ftp_dirs(ftp, remote_dir, created_cache)
 
-        with open(local_path, "rb") as f:
-            ftp.cwd(remote_dir)
-            ftp.storbinary(f"STOR {os.path.basename(local_path)}", f)
+            # cwd nur wechseln, wenn sich das Verzeichnis ändert
+            if remote_dir != current_dir:
+                ftp.cwd(remote_dir)
+                current_dir = remote_dir
 
-        uploaded += 1
-        progress = uploaded / total if total > 0 else 1
-        progress_bar.progress(progress)
-        status_text.info(f"Hochgeladen: {uploaded}/{total} – {os.path.basename(local_path)}")
+            with open(local_path, "rb") as f:
+                ftp.storbinary(f"STOR {os.path.basename(remote_path)}", f)
 
-    ftp.quit()
-    status_text.success("Alle Dateien erfolgreich hochgeladen.")
+            uploaded += 1
+            progress_bar.progress(uploaded / total)
+            status_text.info(f"Hochgeladen: {uploaded}/{total} – {os.path.basename(local_path)}")
+
+        status_text.success(f"Alle {uploaded} Dateien erfolgreich hochgeladen.")
+    finally:
+        try:
+            ftp.quit()
+        except (*ftplib.all_errors, OSError):
+            ftp.close()
 
 def normalize_driver_name(nachname, vorname):
     nachname = str(nachname).strip().title() if pd.notna(nachname) else ""
