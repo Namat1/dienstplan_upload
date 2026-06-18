@@ -4,6 +4,7 @@ from zipfile import ZipFile
 from datetime import datetime
 import tempfile
 import os
+import time
 import ftplib
 from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
@@ -33,7 +34,8 @@ def get_kw(datum):
 def ensure_ftp_dirs(ftp, remote_dir, created_cache):
     remote_dir = remote_dir.replace("\\", "/")
     if remote_dir in created_cache:
-        return
+        return 0.0
+    elapsed = 0.0
     path_built = ""
     for part in remote_dir.split("/"):
         if not part:
@@ -41,13 +43,16 @@ def ensure_ftp_dirs(ftp, remote_dir, created_cache):
         path_built += "/" + part
         if path_built in created_cache:
             continue
+        t = time.perf_counter()
         try:
             ftp.mkd(path_built)
         except error_perm:
             # existiert schon (550) -> ok; alles andere ist ein echter Fehler
             pass
+        elapsed += time.perf_counter() - t
         created_cache.add(path_built)
     created_cache.add(remote_dir)
+    return elapsed
 
 def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
     # Dateien sammeln
@@ -67,12 +72,14 @@ def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
     # nach Zielverzeichnis sortieren -> minimiert cwd-Wechsel
     all_files.sort(key=lambda p: os.path.dirname(p[1]))
 
+    t0 = time.perf_counter()
     ftp = FTP_TLS() if FTP_USE_TLS else FTP()
     ftp.connect(FTP_HOST, 21, timeout=30)
     ftp.login(FTP_USER, FTP_PASS)
     if FTP_USE_TLS:
         ftp.prot_p()
     ftp.set_pasv(True)
+    t_connect = time.perf_counter() - t0
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -80,24 +87,68 @@ def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
     current_dir = None
     uploaded = 0
 
+    # Timing-Akkumulatoren
+    t_mkd = 0.0
+    t_cwd = 0.0
+    t_stor = 0.0
+    bytes_total = 0
+    slowest = []  # (sekunden, name, bytes)
+
     try:
         for local_path, remote_path in all_files:
             remote_dir = os.path.dirname(remote_path).replace("\\", "/")
-            ensure_ftp_dirs(ftp, remote_dir, created_cache)
+            t_mkd += ensure_ftp_dirs(ftp, remote_dir, created_cache)
 
             # cwd nur wechseln, wenn sich das Verzeichnis ändert
             if remote_dir != current_dir:
+                t = time.perf_counter()
                 ftp.cwd(remote_dir)
+                t_cwd += time.perf_counter() - t
                 current_dir = remote_dir
 
+            size = os.path.getsize(local_path)
+            t = time.perf_counter()
             with open(local_path, "rb") as f:
                 ftp.storbinary(f"STOR {os.path.basename(remote_path)}", f)
+            dt = time.perf_counter() - t
+            t_stor += dt
+            bytes_total += size
+            slowest.append((dt, os.path.basename(local_path), size))
 
             uploaded += 1
             progress_bar.progress(uploaded / total)
             status_text.info(f"Hochgeladen: {uploaded}/{total} – {os.path.basename(local_path)}")
 
         status_text.success(f"Alle {uploaded} Dateien erfolgreich hochgeladen.")
+
+        # --- Timing-Auswertung ---
+        gesamt = t_connect + t_mkd + t_cwd + t_stor
+        mb = bytes_total / (1024 * 1024)
+        durchsatz = mb / t_stor if t_stor > 0 else 0.0
+
+        def anteil(x):
+            return f"{(x / gesamt * 100):4.1f}%" if gesamt > 0 else "  –  "
+
+        report = (
+            f"Connect/Login   : {t_connect:6.2f}s  ({anteil(t_connect)})\n"
+            f"Verzeichnis mkd : {t_mkd:6.2f}s  ({anteil(t_mkd)})\n"
+            f"Wechsel cwd     : {t_cwd:6.2f}s  ({anteil(t_cwd)})\n"
+            f"Transfer stor   : {t_stor:6.2f}s  ({anteil(t_stor)})   "
+            f"{mb:.2f} MB @ {durchsatz:.2f} MB/s\n"
+            f"-----------------------------------------\n"
+            f"Summe gemessen  : {gesamt:6.2f}s  fuer {total} Dateien\n"
+            f"O pro Datei     : {gesamt / total:6.3f}s"
+        )
+        st.subheader("Upload-Timing")
+        st.code(report)
+
+        slowest.sort(reverse=True)
+        if slowest:
+            top = "\n".join(
+                f"{z:6.2f}s  {n}  ({b / 1024:.0f} KB)" for z, n, b in slowest[:5]
+            )
+            st.caption("Langsamste Einzeltransfers:")
+            st.code(top)
     finally:
         try:
             ftp.quit()
