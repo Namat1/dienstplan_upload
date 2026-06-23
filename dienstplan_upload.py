@@ -19,6 +19,7 @@ from urllib.error import HTTPError, URLError
 from io import BytesIO
 from openpyxl import load_workbook
 from openpyxl.utils.datetime import from_excel
+from zoneinfo import ZoneInfo
 
 
 # Manche Touren-Exceldateien enthalten beschädigte oder ungewöhnliche
@@ -1639,7 +1640,7 @@ def _arbeitsmappe_schnell_lesen(uploaded_file):
 
 st.set_page_config(page_title="Touren-Export", layout="centered")
 st.title("Dienstplan aktualisieren")
-st.caption("Die Verarbeitung startet erst nach Klick auf „Dienstpläne verarbeiten“.")
+st.caption("Die vorhandene CSV wird nicht heruntergeladen. Es werden nur Dienstpläne ""ab dem heutigen Datum neu erzeugt und auf dem Server ersetzt.")
 
 with st.form("dienstplan_upload_form", clear_on_submit=False):
     uploaded_files = st.file_uploader(
@@ -1824,41 +1825,35 @@ if submitted:
             status.info("Bereinige die neu erzeugten Dienstplandaten …")
             new_csv_df = clean_and_sort_csv(pd.DataFrame(csv_rows))
 
-            existing_csv_df = None
-            retained_rows = 0
-            replaced_rows = 0
+            # Es wird bewusst keine vorhandene CSV mehr geladen.
+            # Die neue Datei enthält Termine ab heute minus 30 Tage
+            # in deutscher Ortszeit und ersetzt die Serverdatei vollständig.
+            heute_berlin = datetime.now(ZoneInfo("Europe/Berlin")).date()
+            grenzdatum = heute_berlin - pd.Timedelta(days=30)
+            datum_werte = pd.to_datetime(
+                new_csv_df["datum"],
+                errors="coerce",
+            ).dt.date
 
-            if all([FTP_HOST, FTP_USER, FTP_PASS]):
-                status.info("Lade die vorhandene dienstplaene.csv …")
-                merge_status, merge_message = download_existing_csv(existing_csv_path)
+            csv_df = new_csv_df.loc[
+                datum_werte.notna() & (datum_werte >= grenzdatum)
+            ].copy()
+            csv_df = clean_and_sort_csv(csv_df)
 
-                if merge_status == "found":
-                    status.info(merge_message)
-                    existing_csv_df = read_dienstplan_csv(existing_csv_path)
-                    st.info(
-                        f"Vorhandene CSV geladen: {len(existing_csv_df):,} Zeilen."
-                        .replace(",", ".")
-                    )
-                elif merge_status == "missing":
-                    st.info(merge_message + " Es wird eine neue Gesamtdatei angelegt.")
-                else:
-                    st.error(merge_message)
-                    st.error(
-                        "Der Vorgang wurde abgebrochen, damit die bestehende CSV "
-                        "nicht versehentlich ersetzt wird."
-                    )
-                    st.stop()
-            else:
-                st.warning(
-                    "FTP-Zugangsdaten fehlen. Der Download enthält daher nur die "
-                    "gerade hochgeladenen Wochen."
+            if csv_df.empty:
+                st.error(
+                    "In den hochgeladenen Dateien wurden keine Dienstpläne ab "
+                    f"{grenzdatum.strftime('%d.%m.%Y')} gefunden."
                 )
+                st.stop()
 
-            status.info("Füge neue und vorhandene Kalenderwochen zusammen …")
-            csv_df, retained_rows, replaced_rows = merge_uploaded_weeks(
-                existing_csv_df,
-                new_csv_df,
-                hochgeladene_wochen,
+            entfernte_zeilen = len(new_csv_df) - len(csv_df)
+            status.info(
+                f"Übernehme {len(csv_df):,} Zeilen ab "
+                f"{grenzdatum.strftime('%d.%m.%Y')} "
+                f"(letzte 30 Tage bis Zukunft). "
+                f"{entfernte_zeilen:,} ältere Zeilen wurden weggelassen."
+                .replace(",", ".")
             )
 
             csv_df.to_csv(
@@ -1903,7 +1898,7 @@ if submitted:
             st.success(
                 f"{len(uploaded_files)} Datei(en) verarbeitet. "
                 f"{len(fahrer_wochen)} Fahrer-Woche(n) neu erstellt. "
-                f"Die Gesamt-CSV enthält jetzt {len(csv_df):,} Zeilen."
+                f"Die neue CSV enthält {len(csv_df):,} Zeilen ab den letzten 30 Tagen und ersetzt die Serverdatei vollständig."
                 .replace(",", ".")
             )
 
