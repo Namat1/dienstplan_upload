@@ -239,7 +239,7 @@ def parse_tour(tour):
     return tour_str
 
 def generate_shared_html(css_styles):
-    """Erzeugt genau eine gemeinsame HTML-Datei, die ihre Daten aus CSV lädt."""
+    """Erzeugt eine CSP-konforme HTML-Datei ohne eingebettetes JavaScript."""
     template = r'''<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -283,8 +283,16 @@ def generate_shared_html(css_styles):
 </div>
 <div class="browser-safe-spacer" aria-hidden="true"></div>
 
-<script>
-(function () {
+<script src="dienstplan_app.js?v=2" defer></script>
+<script src="../../../dienstplan.js" defer></script>
+</body>
+</html>'''
+    return template.replace("__CSS_STYLES__", css_styles)
+
+
+def generate_shared_js():
+    """JavaScript der gemeinsamen Dienstplanseite als externe Datei."""
+    return r'''(function () {
   "use strict";
 
   const params = new URLSearchParams(window.location.search);
@@ -495,11 +503,7 @@ def generate_shared_html(css_styles):
       showMessage("Fehler beim Laden", error.message);
     });
 })();
-</script>
-<script src="../../../dienstplan.js"></script>
-</body>
-</html>'''
-    return template.replace("__CSS_STYLES__", css_styles)
+'''
 
 
 css_styles = """
@@ -981,6 +985,7 @@ if uploaded_files:
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, "gesamt_export.zip")
             html_path = os.path.join(tmpdir, "dienstplan.html")
+            js_path = os.path.join(tmpdir, "dienstplan_app.js")
             csv_path = os.path.join(tmpdir, "dienstplaene.csv")
 
             ausschluss_stichwoerter = [
@@ -1164,6 +1169,9 @@ if uploaded_files:
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(generate_shared_html(css_styles))
 
+            with open(js_path, "w", encoding="utf-8") as f:
+                f.write(generate_shared_js())
+
             csv_df = pd.DataFrame(csv_rows)
 
             # Bei überlappenden Quelldateien können für denselben Fahrer und Tag
@@ -1219,6 +1227,7 @@ if uploaded_files:
 
             with ZipFile(zip_path, "w") as zipf:
                 zipf.write(html_path, arcname="dienstplan.html")
+                zipf.write(js_path, arcname="dienstplan_app.js")
                 zipf.write(csv_path, arcname="dienstplaene.csv")
 
             with open(zip_path, "rb") as f:
@@ -1233,7 +1242,7 @@ if uploaded_files:
 
             st.success(
                 f"{len(uploaded_files)} Datei(en) verarbeitet. "
-                f"Eine HTML-Datei, eine CSV-Datei und "
+                f"Eine HTML-Datei, eine JavaScript-Datei, eine CSV-Datei und "
                 f"{len(fahrer_wochen)} Fahrer-Woche(n) erstellt."
             )
 
@@ -1243,7 +1252,7 @@ if uploaded_files:
             )
 
             st.download_button(
-                "ZIP mit HTML- und CSV-Datei herunterladen",
+                "ZIP mit HTML-, JavaScript- und CSV-Datei herunterladen",
                 data=zip_bytes,
                 file_name="gesamt_export.zip",
                 mime="application/zip"
