@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from zipfile import ZipFile
-from datetime import datetime
+from datetime import datetime, date, time as datetime_time
 import tempfile
 import os
 import time
@@ -12,6 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
 from urllib.parse import quote
+from io import BytesIO
+from openpyxl import load_workbook
+from openpyxl.utils.datetime import from_excel
 
 # .env laden
 load_dotenv()
@@ -20,7 +23,8 @@ FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/")
 FTP_USE_TLS = os.getenv("FTP_TLS", "0") == "1"
-FTP_PARALLEL = int(os.getenv("FTP_PARALLEL", "6"))
+FTP_PARALLEL = int(os.getenv("FTP_PARALLEL", "3"))
+FTP_TIMEOUT = int(os.getenv("FTP_TIMEOUT", "20"))
 
 # Deutsche Wochentage
 wochentage_deutsch_map = {
@@ -46,7 +50,7 @@ def get_plan_kw(start_sonntag):
 def _new_ftp():
     """Eine frische, eingeloggte FTP(S)-Verbindung im Passive-Mode."""
     ftp = FTP_TLS() if FTP_USE_TLS else FTP()
-    ftp.connect(FTP_HOST, 21, timeout=30)
+    ftp.connect(FTP_HOST, 21, timeout=FTP_TIMEOUT)
     ftp.login(FTP_USER, FTP_PASS)
     if FTP_USE_TLS:
         ftp.prot_p()
@@ -392,23 +396,35 @@ def normalize_driver_name(nachname, vorname):
     return ""
 
 def parse_uhrzeit(uhrzeit):
-    if pd.isna(uhrzeit):
+    """Excel-Uhrzeiten schnell und ohne teure Einzel-Konvertierungen lesen."""
+    if uhrzeit is None or pd.isna(uhrzeit):
         return "–"
-    elif isinstance(uhrzeit, (int, float)) and uhrzeit == 0:
-        return "00:00"
-    elif isinstance(uhrzeit, datetime):
+
+    if isinstance(uhrzeit, datetime):
         return uhrzeit.strftime("%H:%M")
-    else:
-        try:
-            uhrzeit_parsed = pd.to_datetime(uhrzeit)
-            return uhrzeit_parsed.strftime("%H:%M")
-        except:
-            uhrzeit_str = str(uhrzeit).strip()
-            if not uhrzeit_str or uhrzeit_str.lower() == "nan":
-                return "–"
-            if ":" in uhrzeit_str:
-                return ":".join(uhrzeit_str.split(":")[:2])
-            return uhrzeit_str
+
+    if isinstance(uhrzeit, datetime_time):
+        return uhrzeit.strftime("%H:%M")
+
+    if isinstance(uhrzeit, (int, float)):
+        wert = float(uhrzeit)
+        if wert == 0:
+            return "00:00"
+        # Excel speichert Uhrzeiten normalerweise als Tagesbruchteil.
+        if 0 <= wert < 1:
+            minuten = int(round(wert * 24 * 60)) % (24 * 60)
+            return f"{minuten // 60:02d}:{minuten % 60:02d}"
+        return str(uhrzeit).strip()
+
+    uhrzeit_str = str(uhrzeit).strip()
+    if not uhrzeit_str or uhrzeit_str.lower() in {"nan", "none", "nat"}:
+        return "–"
+
+    match = re.match(r"^(\d{1,2}):(\d{2})", uhrzeit_str)
+    if match:
+        return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+    return uhrzeit_str
 
 def parse_tour(tour):
     if pd.isna(tour):
@@ -1153,16 +1169,157 @@ body {
 """
 
 
+def _ist_leer(value):
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    return str(value).strip().lower() in {"", "nan", "none", "null", "nat"}
+
+
+def _datum_lesen(value):
+    """Excel-Datum robust und schnell in ein Python-Datum umwandeln."""
+    if _ist_leer(value):
+        return None
+
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    if isinstance(value, (int, float)):
+        try:
+            result = from_excel(value)
+            if isinstance(result, datetime):
+                return result.date()
+            if isinstance(result, date):
+                return result
+        except Exception:
+            return None
+
+    try:
+        parsed = pd.to_datetime(str(value).strip(), errors="coerce", dayfirst=True)
+        if pd.isna(parsed):
+            return None
+        return parsed.date()
+    except Exception:
+        return None
+
+
+def _arbeitsmappe_schnell_lesen(uploaded_file):
+    """Nur die tatsächlich benötigten Excel-Spalten einlesen.
+
+    Der alte Pandas-Import konnte bei formatierten Leerzeilen bis ans Ende des
+    Excel-Blatts laufen. Hier wird nach längeren Leerbereichen abgebrochen.
+    """
+    datei_bytes = uploaded_file.getvalue()
+    workbook = load_workbook(
+        BytesIO(datei_bytes),
+        read_only=True,
+        data_only=True,
+    )
+
+    try:
+        benoetigte_blaetter = {"Touren", "a Fahrer"}
+        fehlend = sorted(benoetigte_blaetter.difference(workbook.sheetnames))
+        if fehlend:
+            raise ValueError(
+                f"In {uploaded_file.name} fehlen die Blätter: {', '.join(fehlend)}"
+            )
+
+        # Fahrerblatt: B = Nachname, C = Vorname, Daten ab Zeile 2.
+        fahrer = []
+        bekannte_fahrer = set()
+        ws_fahrer = workbook["a Fahrer"]
+        leere_zeilen = 0
+
+        for nachname, vorname in ws_fahrer.iter_rows(
+            min_row=2,
+            min_col=2,
+            max_col=3,
+            values_only=True,
+        ):
+            fahrer_name = normalize_driver_name(nachname, vorname)
+            if not fahrer_name:
+                leere_zeilen += 1
+                # Ein langer Leerbereich bedeutet in diesen Dateien das Ende.
+                if leere_zeilen >= 250:
+                    break
+                continue
+
+            leere_zeilen = 0
+            if fahrer_name not in bekannte_fahrer:
+                bekannte_fahrer.add(fahrer_name)
+                fahrer.append(fahrer_name)
+
+        # Tourenblatt: Daten ab Zeile 6.
+        # D/E = Fahrer 1, G/H = Fahrer 2, I = Uhrzeit, O = Datum, P = Tour.
+        ws_touren = workbook["Touren"]
+        touren = []
+        leere_zeilen = 0
+
+        for values in ws_touren.iter_rows(
+            min_row=6,
+            min_col=4,
+            max_col=16,
+            values_only=True,
+        ):
+            nach1, vor1 = values[0], values[1]
+            nach2, vor2 = values[3], values[4]
+            uhrzeit = values[5]
+            datum_raw = values[11]
+            tour = values[12]
+
+            relevante_werte = (nach1, vor1, nach2, vor2, uhrzeit, datum_raw, tour)
+            if all(_ist_leer(value) for value in relevante_werte):
+                leere_zeilen += 1
+                if leere_zeilen >= 500:
+                    break
+                continue
+
+            leere_zeilen = 0
+            datum = _datum_lesen(datum_raw)
+            if datum is None:
+                continue
+
+            fahrer1 = normalize_driver_name(nach1, vor1)
+            fahrer2 = normalize_driver_name(nach2, vor2)
+            if not fahrer1 and not fahrer2:
+                continue
+
+            touren.append({
+                "datum": datum,
+                "uhrzeit": parse_uhrzeit(uhrzeit),
+                "tour": parse_tour(tour),
+                "fahrer": [name for name in (fahrer1, fahrer2) if name],
+            })
+
+        return fahrer, touren
+    finally:
+        workbook.close()
+
+
 st.set_page_config(page_title="Touren-Export", layout="centered")
 st.title("Dienstplan aktualisieren")
+st.caption("Die Verarbeitung startet erst nach Klick auf „Dienstpläne verarbeiten“.")
 
-uploaded_files = st.file_uploader(
-    "Excel-Dateien hochladen (Blatt 'Touren' und 'a Fahrer')",
-    type=["xlsx"],
-    accept_multiple_files=True
-)
+with st.form("dienstplan_upload_form", clear_on_submit=False):
+    uploaded_files = st.file_uploader(
+        "Excel-Dateien hochladen (Blatt 'Touren' und 'a Fahrer')",
+        type=["xlsx"],
+        accept_multiple_files=True,
+    )
+    auto_ftp = st.checkbox("Nach der Verarbeitung automatisch auf FTP hochladen", value=False)
+    submitted = st.form_submit_button("Dienstpläne verarbeiten", type="primary")
 
-if uploaded_files:
+if submitted:
+    if not uploaded_files:
+        st.warning("Bitte mindestens eine Excel-Datei auswählen.")
+        st.stop()
+
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, "gesamt_export.zip")
@@ -1172,13 +1329,8 @@ if uploaded_files:
             existing_csv_path = os.path.join(tmpdir, "dienstplaene_vorhanden.csv")
 
             ausschluss_stichwoerter = [
-                "zippel",
-                "insel",
-                "paasch",
-                "meyer",
-                "ihde",
-                "devies",
-                "insellogistik"
+                "zippel", "insel", "paasch", "meyer",
+                "ihde", "devies", "insellogistik",
             ]
 
             sonder_dateien = {
@@ -1190,8 +1342,6 @@ if uploaded_files:
                 ("schulz", "stephan"): "STSchulz",
                 ("lewandowski", "kamil"): "Lewandowski",
                 ("lewandowski", "dominik"): "DLewandowski",
-                # Zwei verschiedene Fahrer mit gleichem Nachnamen:
-                # Rene behält aus Kompatibilitätsgründen den bisherigen Schlüssel.
                 ("schlutt", "rene"): "Schlutt",
                 ("schlutt", "hubert"): "HSchlutt",
             }
@@ -1201,55 +1351,35 @@ if uploaded_files:
             fahrer_wochen = set()
             hochgeladene_wochen = set()
 
-            for file in uploaded_files:
-                fahrer_df = pd.read_excel(file, sheet_name="a Fahrer", engine="openpyxl")
-                touren_df = pd.read_excel(file, sheet_name="Touren", skiprows=4, engine="openpyxl")
+            fortschritt = st.progress(0)
+            status = st.empty()
+            gesamt_start = time.perf_counter()
 
-                fahrer_dict = {}
-                for _, r in fahrer_df.iterrows():
-                    fahrer_name = normalize_driver_name(r.iloc[1], r.iloc[2])
-                    if fahrer_name:
-                        fahrer_dict[fahrer_name] = {}
+            for datei_index, uploaded_file in enumerate(uploaded_files, start=1):
+                status.info(
+                    f"Lese {uploaded_file.name} "
+                    f"({datei_index}/{len(uploaded_files)}) …"
+                )
+                datei_start = time.perf_counter()
+                fahrer_liste, touren_liste = _arbeitsmappe_schnell_lesen(uploaded_file)
 
-                alle_gueltigen_daten = []
+                if not touren_liste:
+                    st.warning(f"In {uploaded_file.name} wurden keine gültigen Tourenzeilen gefunden.")
+                    fortschritt.progress(datei_index / len(uploaded_files))
+                    continue
 
-                for _, row in touren_df.iterrows():
-                    datum = row.iloc[14]
-                    tour = row.iloc[15]
-                    uhrzeit = row.iloc[8]
+                fahrer_dict = {fahrer_name: {} for fahrer_name in fahrer_liste}
+                global_start_datum = min(eintrag["datum"] for eintrag in touren_liste)
 
-                    datum_dt = None
-                    if pd.notna(datum):
-                        try:
-                            datum_dt = pd.to_datetime(datum)
-                            alle_gueltigen_daten.append(datum_dt)
-                        except Exception:
-                            datum_dt = None
+                for eintrag in touren_liste:
+                    tag = eintrag["datum"]
+                    eintrag_text = f'{eintrag["uhrzeit"]} – {eintrag["tour"]}'
 
-                    uhrzeit_str = parse_uhrzeit(uhrzeit)
-                    tour_str = parse_tour(tour)
-                    eintrag_text = f"{uhrzeit_str} – {tour_str}"
-
-                    for pos in [(3, 4), (6, 7)]:
-                        fahrer_name = normalize_driver_name(row.iloc[pos[0]], row.iloc[pos[1]])
-                        if not fahrer_name:
-                            continue
-
-                        if fahrer_name not in fahrer_dict:
-                            fahrer_dict[fahrer_name] = {}
-
-                        if datum_dt is not None:
-                            tag = datum_dt.date()
-                            if tag not in fahrer_dict[fahrer_name]:
-                                fahrer_dict[fahrer_name][tag] = []
-
-                            if eintrag_text not in fahrer_dict[fahrer_name][tag]:
-                                fahrer_dict[fahrer_name][tag].append(eintrag_text)
-
-                if alle_gueltigen_daten:
-                    global_start_datum = min(alle_gueltigen_daten).date()
-                else:
-                    global_start_datum = pd.Timestamp.today().date()
+                    for fahrer_name in eintrag["fahrer"]:
+                        fahrer_dict.setdefault(fahrer_name, {})
+                        tag_liste = fahrer_dict[fahrer_name].setdefault(tag, [])
+                        if eintrag_text not in tag_liste:
+                            tag_liste.append(eintrag_text)
 
                 global_start_sonntag = global_start_datum - pd.Timedelta(
                     days=(global_start_datum.weekday() + 1) % 7
@@ -1257,11 +1387,10 @@ if uploaded_files:
                 global_kw = get_plan_kw(global_start_sonntag)
                 hochgeladene_wochen.add(pd.Timestamp(global_start_sonntag).date())
 
-                fahrer_dict = dict(sorted(fahrer_dict.items(), key=lambda x: x[0].lower()))
-
-                for fahrer_name, eintraege in fahrer_dict.items():
+                for fahrer_name in sorted(fahrer_dict, key=str.casefold):
+                    eintraege = fahrer_dict[fahrer_name]
                     if eintraege:
-                        start_datum = min(eintraege.keys())
+                        start_datum = min(eintraege)
                         start_sonntag = start_datum - pd.Timedelta(
                             days=(start_datum.weekday() + 1) % 7
                         )
@@ -1270,66 +1399,58 @@ if uploaded_files:
                         start_sonntag = global_start_sonntag
                         kw = global_kw
 
-                    try:
-                        nachname, vorname = [s.strip() for s in fahrer_name.split(",", 1)]
-                    except ValueError:
+                    if "," in fahrer_name:
+                        nachname, vorname = [teil.strip() for teil in fahrer_name.split(",", 1)]
+                    else:
                         nachname, vorname = fahrer_name.strip(), ""
 
-                    n_clean = nachname.lower()
-                    v_clean = vorname.lower()
-
                     filename_part = sonder_dateien.get(
-                        (n_clean, v_clean),
-                        nachname.replace(" ", "_")
+                        (nachname.lower(), vorname.lower()),
+                        nachname.replace(" ", "_"),
                     )
 
-                    alter_dateiname = f"KW{kw:02d}_{filename_part}.html"
-                    filename_lower = alter_dateiname.lower()
-
-                    if "ch._holtz" in filename_lower or any(
-                        stichwort in filename_lower for stichwort in ausschluss_stichwoerter
+                    alter_dateiname = f"KW{kw:02d}_{filename_part}.html".lower()
+                    if "ch._holtz" in alter_dateiname or any(
+                        wort in alter_dateiname for wort in ausschluss_stichwoerter
                     ):
                         continue
 
                     fahrer_wochen.add((kw, filename_part))
                     reihenfolge = 0
 
-                    for i in range(7):
-                        tag_datum = start_sonntag + pd.Timedelta(days=i)
+                    for tag_index in range(7):
+                        tag_datum = start_sonntag + pd.Timedelta(days=tag_index)
+                        tag_key = pd.Timestamp(tag_datum).date()
                         wochentag = wochentage_deutsch_map.get(
-                            tag_datum.strftime("%A"),
-                            tag_datum.strftime("%A")
+                            pd.Timestamp(tag_datum).strftime("%A"),
+                            pd.Timestamp(tag_datum).strftime("%A"),
                         )
 
-                        tag_eintraege = eintraege.get(tag_datum, [])
-                        if not tag_eintraege:
-                            tag_eintraege = ["– – –"]
+                        tag_eintraege = eintraege.get(tag_key, []) or ["– – –"]
 
-                        for eintrag in tag_eintraege:
+                        for eintrag_text in tag_eintraege:
                             reihenfolge += 1
-
-                            if " – " in eintrag:
-                                uhrzeit_str, tour_str = eintrag.split(" – ", 1)
+                            if " – " in eintrag_text:
+                                uhrzeit_str, tour_str = eintrag_text.split(" – ", 1)
                             else:
-                                uhrzeit_str, tour_str = "–", eintrag
+                                uhrzeit_str, tour_str = "–", eintrag_text
 
-                            if not uhrzeit_str or uhrzeit_str.strip() == "–":
+                            uhrzeit_str = uhrzeit_str.strip() or "–"
+                            tour_str = tour_str.strip() or "–"
+                            if uhrzeit_str == "–":
                                 uhrzeit_str = "–"
-                            if not tour_str or tour_str.strip() == "–":
+                            if tour_str == "–":
                                 tour_str = "–"
 
+                            datum_iso = pd.Timestamp(tag_datum).date().isoformat()
                             url = (
                                 f"dienstplan_v4.html?kw={kw:02d}"
                                 f"&fahrer={quote(filename_part, safe='')}"
                             )
 
                             row_key = (
-                                kw,
-                                filename_part,
-                                fahrer_name,
-                                tag_datum.isoformat(),
-                                uhrzeit_str,
-                                tour_str,
+                                kw, filename_part, fahrer_name,
+                                datum_iso, uhrzeit_str, tour_str,
                             )
                             if row_key in bekannte_zeilen:
                                 continue
@@ -1339,7 +1460,7 @@ if uploaded_files:
                                 "kw": kw,
                                 "fahrer_key": filename_part,
                                 "fahrer_name": fahrer_name,
-                                "datum": tag_datum.isoformat(),
+                                "datum": datum_iso,
                                 "wochentag": wochentag,
                                 "uhrzeit": uhrzeit_str,
                                 "tour": tour_str,
@@ -1347,36 +1468,37 @@ if uploaded_files:
                                 "url": url,
                             })
 
+                dauer_datei = time.perf_counter() - datei_start
+                status.info(
+                    f"{uploaded_file.name}: {len(touren_liste):,} Tourenzeilen "
+                    f"in {dauer_datei:.1f} Sekunden gelesen."
+                    .replace(",", ".")
+                )
+                fortschritt.progress(datei_index / len(uploaded_files))
+
             if not csv_rows:
                 st.warning("Es wurden keine Dienstplandaten erzeugt.")
                 st.stop()
 
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(generate_shared_html(css_styles))
+            status.info("Erzeuge gemeinsame HTML- und JavaScript-Datei …")
+            with open(html_path, "w", encoding="utf-8") as handle:
+                handle.write(generate_shared_html(css_styles))
+            with open(js_path, "w", encoding="utf-8") as handle:
+                handle.write(generate_shared_js())
 
-            with open(js_path, "w", encoding="utf-8") as f:
-                f.write(generate_shared_js())
-
+            status.info("Bereinige die neu erzeugten Dienstplandaten …")
             new_csv_df = clean_and_sort_csv(pd.DataFrame(csv_rows))
 
             existing_csv_df = None
             retained_rows = 0
             replaced_rows = 0
-            merge_status = "missing"
 
             if all([FTP_HOST, FTP_USER, FTP_PASS]):
+                status.info("Lade die vorhandene dienstplaene.csv vom FTP-Server …")
                 merge_status, merge_message = download_existing_csv_from_ftp(existing_csv_path)
 
                 if merge_status == "found":
-                    try:
-                        existing_csv_df = read_dienstplan_csv(existing_csv_path)
-                    except Exception as exc:
-                        st.error(str(exc))
-                        st.error(
-                            "Der Vorgang wurde aus Sicherheitsgründen abgebrochen, "
-                            "damit keine vorhandenen Kalenderwochen überschrieben werden."
-                        )
-                        st.stop()
+                    existing_csv_df = read_dienstplan_csv(existing_csv_path)
                     st.info(
                         f"Vorhandene CSV geladen: {len(existing_csv_df):,} Zeilen."
                         .replace(",", ".")
@@ -1386,17 +1508,17 @@ if uploaded_files:
                 else:
                     st.error(merge_message)
                     st.error(
-                        "Der Vorgang wurde aus Sicherheitsgründen abgebrochen, "
-                        "damit die bestehende CSV nicht versehentlich ersetzt wird."
+                        "Der Vorgang wurde abgebrochen, damit die bestehende CSV "
+                        "nicht versehentlich ersetzt wird."
                     )
                     st.stop()
             else:
                 st.warning(
-                    "FTP-Zugangsdaten fehlen. Die vorhandene dienstplaene.csv kann "
-                    "nicht eingelesen werden; der Download enthält daher nur die "
+                    "FTP-Zugangsdaten fehlen. Der Download enthält daher nur die "
                     "gerade hochgeladenen Wochen."
                 )
 
+            status.info("Füge neue und vorhandene Kalenderwochen zusammen …")
             csv_df, retained_rows, replaced_rows = merge_uploaded_weeks(
                 existing_csv_df,
                 new_csv_df,
@@ -1408,22 +1530,23 @@ if uploaded_files:
                 sep=";",
                 index=False,
                 encoding="utf-8-sig",
-                lineterminator="\n"
+                lineterminator="\n",
             )
 
+            status.info("Erstelle ZIP-Datei …")
             with ZipFile(zip_path, "w") as zipf:
                 zipf.write(html_path, arcname="dienstplan_v4.html")
                 zipf.write(js_path, arcname="dienstplan_app_v4.js")
                 zipf.write(csv_path, arcname="dienstplaene.csv")
 
-            with open(zip_path, "rb") as f:
-                zip_bytes = f.read()
+            with open(zip_path, "rb") as handle:
+                zip_bytes = handle.read()
 
-            if st.checkbox("Automatisch auf FTP hochladen", value=False):
+            if auto_ftp:
                 if not all([FTP_HOST, FTP_USER, FTP_PASS]):
-                    st.warning("FTP-Zugangsdaten fehlen in .env")
+                    st.warning("FTP-Zugangsdaten fehlen in der .env-Datei.")
                 else:
-                    st.info("Starte FTP-Upload ...")
+                    status.info("Lade die drei Dateien auf den FTP-Server …")
                     upload_folder_to_ftp_with_progress(
                         tmpdir,
                         FTP_BASE_DIR,
@@ -1433,6 +1556,9 @@ if uploaded_files:
                             "dienstplaene.csv",
                         },
                     )
+
+            gesamt_dauer = time.perf_counter() - gesamt_start
+            status.success(f"Fertig nach {gesamt_dauer:.1f} Sekunden.")
 
             wochen_text = ", ".join(
                 pd.Timestamp(woche).strftime("%d.%m.%Y")
@@ -1452,22 +1578,13 @@ if uploaded_files:
                     f"{retained_rows:,} Zeilen aus anderen Wochen beibehalten."
                     .replace(",", ".")
                 )
-            else:
-                st.info(
-                    f"Erzeugte Planwoche(n), jeweils ab Sonntag: {wochen_text}."
-                )
-
-            st.info(
-                "Aufruf künftig zum Beispiel: "
-                "dienstplan_v4.html?kw=26&fahrer=Mueller"
-            )
 
             st.download_button(
                 "ZIP mit HTML-, JavaScript- und CSV-Datei herunterladen",
                 data=zip_bytes,
                 file_name="gesamt_export.zip",
-                mime="application/zip"
+                mime="application/zip",
             )
 
-    except Exception as e:
-        st.error(f"Fehler beim Verarbeiten: {e}")
+    except Exception as exc:
+        st.exception(exc)
