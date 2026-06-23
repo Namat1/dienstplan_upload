@@ -33,8 +33,15 @@ wochentage_deutsch_map = {
     "Sunday": "Sonntag"
 }
 
-def get_kw(datum):
-    return datum.isocalendar()[1]
+def get_plan_kw(start_sonntag):
+    """Kalenderwoche der Planwoche Sonntag bis Samstag.
+
+    Maßgeblich ist der Montag innerhalb dieser Planwoche. Dadurch wird
+    der Jahreswechsel korrekt behandelt: 28.12.2025 bis 03.01.2026
+    gehört zur Kalenderwoche 01/2026 und nicht zu Kalenderwoche 53.
+    """
+    montag = pd.Timestamp(start_sonntag) + pd.Timedelta(days=1)
+    return int(montag.isocalendar().week)
 
 def _new_ftp():
     """Eine frische, eingeloggte FTP(S)-Verbindung im Passive-Mode."""
@@ -1058,7 +1065,7 @@ if uploaded_files:
                 global_start_sonntag = global_start_datum - pd.Timedelta(
                     days=(global_start_datum.weekday() + 1) % 7
                 )
-                global_kw = get_kw(global_start_sonntag) + 1
+                global_kw = get_plan_kw(global_start_sonntag)
 
                 fahrer_dict = dict(sorted(fahrer_dict.items(), key=lambda x: x[0].lower()))
 
@@ -1068,7 +1075,7 @@ if uploaded_files:
                         start_sonntag = start_datum - pd.Timedelta(
                             days=(start_datum.weekday() + 1) % 7
                         )
-                        kw = get_kw(start_sonntag) + 1
+                        kw = get_plan_kw(start_sonntag)
                     else:
                         start_sonntag = global_start_sonntag
                         kw = global_kw
