@@ -8,6 +8,8 @@ import time
 import ftplib
 import threading
 import re
+import socket
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
@@ -15,6 +17,16 @@ from urllib.parse import quote
 from io import BytesIO
 from openpyxl import load_workbook
 from openpyxl.utils.datetime import from_excel
+
+
+# Manche Touren-Exceldateien enthalten beschädigte oder ungewöhnliche
+# Kopf-/Fußzeilen. openpyxl ignoriert diese ohnehin; die Warnung würde bei
+# vielen Dateien nur das Streamlit-Protokoll überfluten.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Cannot parse header or footer so it will be ignored",
+    category=UserWarning,
+)
 
 # .env laden
 load_dotenv()
@@ -24,7 +36,8 @@ FTP_PASS = os.getenv("FTP_PASS")
 FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/")
 FTP_USE_TLS = os.getenv("FTP_TLS", "0") == "1"
 FTP_PARALLEL = int(os.getenv("FTP_PARALLEL", "3"))
-FTP_TIMEOUT = int(os.getenv("FTP_TIMEOUT", "20"))
+FTP_TIMEOUT = max(5, min(int(os.getenv("FTP_TIMEOUT", "15")), 30))
+FTP_DOWNLOAD_MAX_SECONDS = max(15, int(os.getenv("FTP_DOWNLOAD_MAX_SECONDS", "45")))
 
 # Deutsche Wochentage
 wochentage_deutsch_map = {
@@ -187,52 +200,115 @@ CSV_COLUMNS = [
 
 
 def download_existing_csv_from_ftp(local_path):
-    """Vorhandene dienstplaene.csv vom Zielordner laden.
+    """Vorhandene dienstplaene.csv mit Zeitbegrenzung vom FTP laden.
 
     Rückgabe: (status, meldung)
     status ist "found", "missing" oder "error".
+
+    Wichtig:
+    - Die Datei wird zunächst als .part gespeichert.
+    - Ein blockierendes FTP-QUIT wird vermieden; die Verbindung wird direkt
+      geschlossen.
+    - Socket- und Gesamtzeit verhindern ein endloses Hängen.
     """
     ftp = None
+    part_path = str(local_path) + ".part"
+    start_time = time.monotonic()
+    downloaded = 0
+    remote_size = None
+
     try:
+        for path in (local_path, part_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
         ftp = _new_ftp()
+
+        # Sicherheitshalber auch nach dem Login den Socket-Timeout setzen.
+        if getattr(ftp, "sock", None) is not None:
+            ftp.sock.settimeout(FTP_TIMEOUT)
+
         remote_dir = (FTP_BASE_DIR or "/").replace("\\", "/")
         if remote_dir and remote_dir != "/":
             ftp.cwd(remote_dir)
 
-        with open(local_path, "wb") as handle:
-            ftp.retrbinary("RETR dienstplaene.csv", handle.write)
+        try:
+            remote_size = ftp.size("dienstplaene.csv")
+        except (*ftplib.all_errors, OSError):
+            remote_size = None
 
-        if not os.path.isfile(local_path) or os.path.getsize(local_path) == 0:
-            try:
-                os.remove(local_path)
-            except OSError:
-                pass
+        with open(part_path, "wb") as handle:
+            def write_block(block):
+                nonlocal downloaded
+
+                elapsed = time.monotonic() - start_time
+                if elapsed > FTP_DOWNLOAD_MAX_SECONDS:
+                    raise TimeoutError(
+                        f"FTP-Download nach {FTP_DOWNLOAD_MAX_SECONDS} Sekunden abgebrochen."
+                    )
+
+                handle.write(block)
+                downloaded += len(block)
+
+            ftp.retrbinary(
+                "RETR dienstplaene.csv",
+                write_block,
+                blocksize=64 * 1024,
+            )
+
+        elapsed = time.monotonic() - start_time
+
+        if not os.path.isfile(part_path) or os.path.getsize(part_path) == 0:
             return "missing", "Die vorhandene dienstplaene.csv ist leer oder nicht vorhanden."
 
-        return "found", "Vorhandene dienstplaene.csv wurde vom FTP-Server geladen."
+        actual_size = os.path.getsize(part_path)
+        if remote_size is not None and int(remote_size) > 0 and actual_size != int(remote_size):
+            return (
+                "error",
+                "Der FTP-Download war unvollständig "
+                f"({actual_size:,} von {int(remote_size):,} Bytes).".replace(",", "."),
+            )
+
+        os.replace(part_path, local_path)
+
+        return (
+            "found",
+            f"Vorhandene dienstplaene.csv wurde in {elapsed:.1f} Sekunden geladen "
+            f"({actual_size / 1024 / 1024:.1f} MB).",
+        )
 
     except error_perm as exc:
-        # 550 bedeutet bei FTP in der Regel: Datei oder Ordner nicht vorhanden.
         if str(exc).lstrip().startswith("550"):
-            try:
-                if os.path.exists(local_path):
-                    os.remove(local_path)
-            except OSError:
-                pass
             return "missing", "Auf dem FTP-Server wurde noch keine dienstplaene.csv gefunden."
         return "error", f"FTP-Zugriffsfehler beim Laden der vorhandenen CSV: {exc}"
+
+    except (socket.timeout, TimeoutError) as exc:
+        return (
+            "error",
+            "Zeitüberschreitung beim FTP-Download. "
+            f"Der Server hat nicht innerhalb der erlaubten Zeit geantwortet: {exc}",
+        )
+
     except Exception as exc:
         return "error", f"Vorhandene CSV konnte nicht vom FTP-Server geladen werden: {exc}"
+
     finally:
+        # ftp.quit() kann bei manchen Servern nach einem erfolgreichen Transfer
+        # hängen. close() beendet die Verbindung ohne weitere Serverantwort.
         if ftp is not None:
             try:
-                ftp.quit()
-            except (*ftplib.all_errors, OSError):
-                try:
-                    ftp.close()
-                except Exception:
-                    pass
+                ftp.close()
+            except Exception:
+                pass
 
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except OSError:
+            pass
 
 def read_dienstplan_csv(path):
     """Dienstplan-CSV robust lesen und auf das erwartete Schema bringen."""
@@ -1498,6 +1574,7 @@ if submitted:
                 merge_status, merge_message = download_existing_csv_from_ftp(existing_csv_path)
 
                 if merge_status == "found":
+                    status.info(merge_message)
                     existing_csv_df = read_dienstplan_csv(existing_csv_path)
                     st.info(
                         f"Vorhandene CSV geladen: {len(existing_csv_df):,} Zeilen."
