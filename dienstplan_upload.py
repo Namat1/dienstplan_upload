@@ -7,6 +7,7 @@ import os
 import time
 import ftplib
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
@@ -165,13 +166,31 @@ def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
         )
 
 def normalize_driver_name(nachname, vorname):
-    nachname = str(nachname).strip().title() if pd.notna(nachname) else ""
-    vorname = str(vorname).strip().title() if pd.notna(vorname) else ""
+    """Fahrernamen bereinigen; leere Excel-Zellen können als 0/0.0 erscheinen."""
+    def clean_part(value):
+        if pd.isna(value):
+            return ""
 
-    if not nachname and not vorname:
-        return ""
+        value_str = str(value).strip()
+        value_lower = value_str.lower()
 
-    return f"{nachname}, {vorname}".strip().strip(",")
+        if value_lower in {"", "nan", "none", "null", "nat", "-", "–"}:
+            return ""
+        if re.fullmatch(r"0+(?:[.,]0+)?", value_str):
+            return ""
+
+        return value_str.title()
+
+    nachname = clean_part(nachname)
+    vorname = clean_part(vorname)
+
+    if nachname and vorname:
+        return f"{nachname}, {vorname}"
+    if nachname:
+        return nachname
+    if vorname:
+        return vorname
+    return ""
 
 def parse_uhrzeit(uhrzeit):
     if pd.isna(uhrzeit):
@@ -218,7 +237,7 @@ def generate_shared_html(css_styles):
 <body>
 <div class="container-outer">
   <div class="back-bar">
-    <a href="plane.php" class="btn-back" id="btnBack">
+    <a href="../../../plane.php" class="btn-back" id="btnBack">
       <span class="btn-back-arrow" aria-hidden="true">‹</span>
       <span>Zurück</span>
     </a>
@@ -460,7 +479,7 @@ def generate_shared_html(css_styles):
     });
 })();
 </script>
-<script src="dienstplan.js"></script>
+<script src="../../../dienstplan.js"></script>
 </body>
 </html>'''
     return template.replace("__CSS_STYLES__", css_styles)
