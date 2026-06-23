@@ -10,6 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
+from urllib.parse import quote
 
 # .env laden
 load_dotenv()
@@ -201,21 +202,23 @@ def parse_tour(tour):
 
     return tour_str
 
-def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
-    period_end = start_date + pd.Timedelta(days=6)
-
-    html = f"""<!DOCTYPE html>
+def generate_shared_html(css_styles):
+    """Erzeugt genau eine gemeinsame HTML-Datei, die ihre Daten aus CSV lädt."""
+    template = r'''<!DOCTYPE html>
 <html lang="de">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>KW{kw:02d} – {fahrer_name}</title>
-  <style>{css_styles}</style>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Dienstplan</title>
+  <style>__CSS_STYLES__</style>
 </head>
 <body>
 <div class="container-outer">
   <div class="back-bar">
-    <a href="../../../../plane.php" class="btn-back" id="btnBack">
+    <a href="plane.php" class="btn-back" id="btnBack">
       <span class="btn-back-arrow" aria-hidden="true">‹</span>
       <span>Zurück</span>
     </a>
@@ -230,96 +233,237 @@ def generate_html(fahrer_name, eintraege, kw, start_date, css_styles):
     <div class="hero-main">
       <div class="hero-kw">
         <span class="hero-kw-label">Woche</span>
-        <span class="hero-kw-number">{kw:02d}</span>
+        <span class="hero-kw-number" id="kwNumber">--</span>
       </div>
 
       <div class="hero-meta">
-        <div class="headline-name">{fahrer_name}</div>
-        <div class="headline-period">{start_date.strftime('%d.%m.%Y')} – {period_end.strftime('%d.%m.%Y')}</div>
+        <div class="headline-name" id="driverName">Dienstplan wird geladen</div>
+        <div class="headline-period" id="periodText">Bitte einen Moment</div>
       </div>
     </div>
   </header>
 
-  <main class="week-list">"""
-
-    for eintrag in eintraege:
-        date_text, content = eintrag.split(": ", 1)
-        date_obj = pd.to_datetime(date_text.split(" ")[0], format="%d.%m.%Y")
-        weekday = date_text.split("(")[-1].replace(")", "")
-
-        if "–" in content:
-            uhrzeit, tour = [x.strip() for x in content.split("–", 1)]
-        else:
-            uhrzeit, tour = "–", content.strip()
-
-        if not uhrzeit:
-            uhrzeit = "–"
-        if not tour:
-            tour = "–"
-
-        card_class = "daycard"
-        badge_text = "Dienst"
-        icon = "🚚"
-
-        content_check = f"{uhrzeit} {tour}".lower()
-        if weekday == "Samstag":
-            card_class += " samstag"
-            badge_text = "Samstag"
-        elif weekday == "Sonntag":
-            card_class += " sonntag"
-            badge_text = "Sonntag"
-
-        if tour == "–" and uhrzeit == "–":
-            card_class += " leer"
-            badge_text = "Kein Eintrag"
-            icon = "—"
-        elif "urlaub" in content_check:
-            card_class += " frei"
-            badge_text = "Urlaub"
-            icon = "☀️"
-        elif "frei" in content_check:
-            card_class += " frei"
-            badge_text = "Frei"
-            icon = "🕊️"
-        elif "ausgleich" in content_check:
-            card_class += " frei"
-            badge_text = "Ausgleich"
-            icon = "🛌"
-        elif "krank" in content_check:
-            card_class += " krank"
-            badge_text = "Krank"
-            icon = "💊"
-
-        html += f"""
-    <section class="{card_class}">
-      <div class="day-top">
-        <div class="day-date">
-          <div class="weekday">{weekday}</div>
-          <div class="prominent-date">{date_obj.strftime('%d.%m.%Y')}</div>
-        </div>
-        <div class="day-badge"><span>{icon}</span>{badge_text}</div>
-      </div>
-
-      <div class="info">
-        <div class="info-block tour-block">
-          <span class="label">Tour / Aufgabe:</span>
-          <span class="value">{tour}</span>
-        </div>
-        <div class="info-block time-block">
-          <span class="label">Uhrzeit:</span>
-          <span class="value">{uhrzeit}</span>
-        </div>
-      </div>
-    </section>"""
-
-    html += """
-  </main>
+  <main class="week-list" id="weekList"></main>
 </div>
 <div class="browser-safe-spacer" aria-hidden="true"></div>
-<script src="../../../../dienstplan.js"></script>
+
+<script>
+(function () {
+  "use strict";
+
+  const params = new URLSearchParams(window.location.search);
+  const requestedKw = params.get("kw");
+  const requestedDriver = params.get("fahrer") || params.get("driver");
+
+  const weekList = document.getElementById("weekList");
+  const kwNumber = document.getElementById("kwNumber");
+  const driverName = document.getElementById("driverName");
+  const periodText = document.getElementById("periodText");
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function parseCsv(text, delimiter = ";") {
+    const rows = [];
+    let row = [];
+    let field = "";
+    let quoted = false;
+
+    for (let i = 0; i < text.length; i += 1) {
+      const char = text[i];
+
+      if (quoted) {
+        if (char === '"') {
+          if (text[i + 1] === '"') {
+            field += '"';
+            i += 1;
+          } else {
+            quoted = false;
+          }
+        } else {
+          field += char;
+        }
+      } else if (char === '"') {
+        quoted = true;
+      } else if (char === delimiter) {
+        row.push(field);
+        field = "";
+      } else if (char === "\n") {
+        row.push(field.replace(/\r$/, ""));
+        rows.push(row);
+        row = [];
+        field = "";
+      } else {
+        field += char;
+      }
+    }
+
+    if (field.length > 0 || row.length > 0) {
+      row.push(field.replace(/\r$/, ""));
+      rows.push(row);
+    }
+
+    if (!rows.length) return [];
+
+    const headers = rows.shift().map((header, index) =>
+      index === 0 ? header.replace(/^\uFEFF/, "") : header
+    );
+
+    return rows
+      .filter(values => values.some(value => value !== ""))
+      .map(values => {
+        const item = {};
+        headers.forEach((header, index) => {
+          item[header] = values[index] ?? "";
+        });
+        return item;
+      });
+  }
+
+  function normalizeKw(value) {
+    const number = Number.parseInt(value, 10);
+    return Number.isFinite(number) ? String(number) : "";
+  }
+
+  function formatDate(isoDate) {
+    const parts = String(isoDate).split("-");
+    if (parts.length !== 3) return isoDate;
+    return `${parts[2]}.${parts[1]}.${parts[0]}`;
+  }
+
+  function createDayCard(entry) {
+    const weekday = entry.wochentag || "";
+    const time = entry.uhrzeit || "–";
+    const tour = entry.tour || "–";
+    const contentCheck = `${time} ${tour}`.toLowerCase();
+
+    let cardClass = "daycard";
+    let badgeText = "Dienst";
+    let icon = "🚚";
+
+    if (weekday === "Samstag") {
+      cardClass += " samstag";
+      badgeText = "Samstag";
+    } else if (weekday === "Sonntag") {
+      cardClass += " sonntag";
+      badgeText = "Sonntag";
+    }
+
+    if (tour === "–" && time === "–") {
+      cardClass += " leer";
+      badgeText = "Kein Eintrag";
+      icon = "—";
+    } else if (contentCheck.includes("urlaub")) {
+      cardClass += " frei";
+      badgeText = "Urlaub";
+      icon = "☀️";
+    } else if (contentCheck.includes("frei")) {
+      cardClass += " frei";
+      badgeText = "Frei";
+      icon = "🕊️";
+    } else if (contentCheck.includes("ausgleich")) {
+      cardClass += " frei";
+      badgeText = "Ausgleich";
+      icon = "🛌";
+    } else if (contentCheck.includes("krank")) {
+      cardClass += " krank";
+      badgeText = "Krank";
+      icon = "💊";
+    }
+
+    return `
+      <section class="${cardClass}">
+        <div class="day-top">
+          <div class="day-date">
+            <div class="weekday">${escapeHtml(weekday)}</div>
+            <div class="prominent-date">${escapeHtml(formatDate(entry.datum))}</div>
+          </div>
+          <div class="day-badge"><span>${icon}</span>${escapeHtml(badgeText)}</div>
+        </div>
+
+        <div class="info">
+          <div class="info-block tour-block">
+            <span class="label">Tour / Aufgabe:</span>
+            <span class="value">${escapeHtml(tour)}</span>
+          </div>
+          <div class="info-block time-block">
+            <span class="label">Uhrzeit:</span>
+            <span class="value">${escapeHtml(time)}</span>
+          </div>
+        </div>
+      </section>`;
+  }
+
+  function showMessage(title, detail) {
+    driverName.textContent = title;
+    periodText.textContent = detail;
+    weekList.innerHTML = `
+      <section class="daycard leer">
+        <div class="info-block">
+          <span class="value">${escapeHtml(detail)}</span>
+        </div>
+      </section>`;
+  }
+
+  if (!requestedKw || !requestedDriver) {
+    showMessage(
+      "Dienstplan nicht ausgewählt",
+      "Der Aufruf benötigt die Angaben kw und fahrer, zum Beispiel: dienstplan.html?kw=26&fahrer=Mueller"
+    );
+    return;
+  }
+
+  fetch(`dienstplaene.csv?v=${Date.now()}`, { cache: "no-store" })
+    .then(response => {
+      if (!response.ok) {
+        throw new Error(`CSV konnte nicht geladen werden (${response.status}).`);
+      }
+      return response.text();
+    })
+    .then(text => {
+      const data = parseCsv(text);
+      const selected = data
+        .filter(entry =>
+          normalizeKw(entry.kw) === normalizeKw(requestedKw) &&
+          entry.fahrer_key === requestedDriver
+        )
+        .sort((a, b) => Number(a.reihenfolge) - Number(b.reihenfolge));
+
+      if (!selected.length) {
+        kwNumber.textContent = String(requestedKw).padStart(2, "0");
+        showMessage(
+          "Kein Dienstplan gefunden",
+          `Für Kalenderwoche ${requestedKw} und Fahrer ${requestedDriver} sind keine Daten vorhanden.`
+        );
+        return;
+      }
+
+      const first = selected[0];
+      const dates = selected.map(entry => entry.datum).filter(Boolean).sort();
+      const startDate = dates[0];
+      const endDate = dates[dates.length - 1];
+
+      kwNumber.textContent = String(first.kw).padStart(2, "0");
+      driverName.textContent = first.fahrer_name;
+      periodText.textContent = `${formatDate(startDate)} – ${formatDate(endDate)}`;
+      document.title = `KW${String(first.kw).padStart(2, "0")} – ${first.fahrer_name}`;
+      weekList.innerHTML = selected.map(createDayCard).join("");
+    })
+    .catch(error => {
+      showMessage("Fehler beim Laden", error.message);
+    });
+})();
+</script>
+<script src="dienstplan.js"></script>
 </body>
-</html>"""
-    return html
+</html>'''
+    return template.replace("__CSS_STYLES__", css_styles)
 
 
 css_styles = """
@@ -800,160 +944,202 @@ if uploaded_files:
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, "gesamt_export.zip")
+            html_path = os.path.join(tmpdir, "dienstplan.html")
+            csv_path = os.path.join(tmpdir, "dienstplaene.csv")
 
-            with ZipFile(zip_path, "w") as zipf:
-                ausschluss_stichwoerter = [
-                    "zippel",
-                    "insel",
-                    "paasch",
-                    "meyer",
-                    "ihde",
-                    "devies",
-                    "insellogistik"
-                ]
+            ausschluss_stichwoerter = [
+                "zippel",
+                "insel",
+                "paasch",
+                "meyer",
+                "ihde",
+                "devies",
+                "insellogistik"
+            ]
 
-                sonder_dateien = {
-                    ("fechner", "klaus"): "KFechner",
-                    ("fechner", "danny"): "Fechner",
-                    ("scheil", "rene"): "RScheil",
-                    ("scheil", "eric"): "Scheil",
-                    ("schulz", "julian"): "Schulz",
-                    ("schulz", "stephan"): "STSchulz",
-                    ("lewandowski", "kamil"): "Lewandowski",
-                    ("lewandowski", "dominik"): "DLewandowski",
-                }
+            sonder_dateien = {
+                ("fechner", "klaus"): "KFechner",
+                ("fechner", "danny"): "Fechner",
+                ("scheil", "rene"): "RScheil",
+                ("scheil", "eric"): "Scheil",
+                ("schulz", "julian"): "Schulz",
+                ("schulz", "stephan"): "STSchulz",
+                ("lewandowski", "kamil"): "Lewandowski",
+                ("lewandowski", "dominik"): "DLewandowski",
+            }
 
-                erzeugte_dateien = 0
+            csv_rows = []
+            bekannte_zeilen = set()
+            fahrer_wochen = set()
 
-                for file in uploaded_files:
-                    # Blatt "a Fahrer" laden: Spalte B = Nachname, Spalte C = Vorname
-                    fahrer_df = pd.read_excel(file, sheet_name="a Fahrer", engine="openpyxl")
+            for file in uploaded_files:
+                fahrer_df = pd.read_excel(file, sheet_name="a Fahrer", engine="openpyxl")
+                touren_df = pd.read_excel(file, sheet_name="Touren", skiprows=4, engine="openpyxl")
 
-                    # Blatt "Touren" laden
-                    touren_df = pd.read_excel(file, sheet_name="Touren", skiprows=4, engine="openpyxl")
+                fahrer_dict = {}
+                for _, r in fahrer_df.iterrows():
+                    fahrer_name = normalize_driver_name(r.iloc[1], r.iloc[2])
+                    if fahrer_name:
+                        fahrer_dict[fahrer_name] = {}
 
-                    # Alle Fahrer zuerst aus "a Fahrer" sammeln
-                    fahrer_dict = {}
-                    for _, r in fahrer_df.iterrows():
-                        fahrer_name = normalize_driver_name(r.iloc[1], r.iloc[2])
-                        if fahrer_name:
-                            fahrer_dict[fahrer_name] = {}
+                alle_gueltigen_daten = []
 
-                    # Alle gültigen Daten sammeln für Fallback-Woche
-                    alle_gueltigen_daten = []
+                for _, row in touren_df.iterrows():
+                    datum = row.iloc[14]
+                    tour = row.iloc[15]
+                    uhrzeit = row.iloc[8]
 
-                    # Touren aus Blatt "Touren" einlesen
-                    for _, row in touren_df.iterrows():
-                        datum = row.iloc[14]
-                        tour = row.iloc[15]
-                        uhrzeit = row.iloc[8]
-
-                        datum_dt = None
-                        if pd.notna(datum):
-                            try:
-                                datum_dt = pd.to_datetime(datum)
-                                alle_gueltigen_daten.append(datum_dt)
-                            except:
-                                datum_dt = None
-
-                        uhrzeit_str = parse_uhrzeit(uhrzeit)
-                        tour_str = parse_tour(tour)
-                        eintrag_text = f"{uhrzeit_str} – {tour_str}"
-
-                        for pos in [(3, 4), (6, 7)]:
-                            fahrer_name = normalize_driver_name(row.iloc[pos[0]], row.iloc[pos[1]])
-                            if not fahrer_name:
-                                continue
-
-                            # Falls im Tourenblatt ein Fahrer steht, der in "a Fahrer" fehlt:
-                            if fahrer_name not in fahrer_dict:
-                                fahrer_dict[fahrer_name] = {}
-
-                            if datum_dt is not None:
-                                tag = datum_dt.date()
-                                if tag not in fahrer_dict[fahrer_name]:
-                                    fahrer_dict[fahrer_name][tag] = []
-
-                                if eintrag_text not in fahrer_dict[fahrer_name][tag]:
-                                    fahrer_dict[fahrer_name][tag].append(eintrag_text)
-
-                    # Fallback-Woche bestimmen
-                    if alle_gueltigen_daten:
-                        global_start_datum = min(alle_gueltigen_daten).date()
-                    else:
-                        global_start_datum = pd.Timestamp.today().date()
-
-                    global_start_sonntag = global_start_datum - pd.Timedelta(days=(global_start_datum.weekday() + 1) % 7)
-                    global_kw = get_kw(global_start_sonntag) + 1
-
-                    # Alphabetisch sortieren
-                    fahrer_dict = dict(sorted(fahrer_dict.items(), key=lambda x: x[0].lower()))
-
-                    for fahrer_name, eintraege in fahrer_dict.items():
-                        if eintraege:
-                            start_datum = min(eintraege.keys())
-                            start_sonntag = start_datum - pd.Timedelta(days=(start_datum.weekday() + 1) % 7)
-                            kw = get_kw(start_sonntag) + 1
-                        else:
-                            start_sonntag = global_start_sonntag
-                            kw = global_kw
-
-                        wochen_eintraege = []
-                        for i in range(7):
-                            tag_datum = start_sonntag + pd.Timedelta(days=i)
-                            wochentag = wochentage_deutsch_map.get(
-                                tag_datum.strftime("%A"),
-                                tag_datum.strftime("%A")
-                            )
-
-                            if tag_datum in eintraege and len(eintraege[tag_datum]) > 0:
-                                for eintrag in eintraege[tag_datum]:
-                                    wochen_eintraege.append(
-                                        f"{tag_datum.strftime('%d.%m.%Y')} ({wochentag}): {eintrag}"
-                                    )
-                            else:
-                                wochen_eintraege.append(
-                                    f"{tag_datum.strftime('%d.%m.%Y')} ({wochentag}): –"
-                                )
-
+                    datum_dt = None
+                    if pd.notna(datum):
                         try:
-                            nachname, vorname = [s.strip() for s in fahrer_name.split(",", 1)]
-                        except ValueError:
-                            nachname, vorname = fahrer_name.strip(), ""
+                            datum_dt = pd.to_datetime(datum)
+                            alle_gueltigen_daten.append(datum_dt)
+                        except Exception:
+                            datum_dt = None
 
-                        n_clean = nachname.lower()
-                        v_clean = vorname.lower()
+                    uhrzeit_str = parse_uhrzeit(uhrzeit)
+                    tour_str = parse_tour(tour)
+                    eintrag_text = f"{uhrzeit_str} – {tour_str}"
 
-                        filename_part = sonder_dateien.get(
-                            (n_clean, v_clean),
-                            nachname.replace(" ", "_")
-                        )
-
-                        filename = f"KW{kw:02d}_{filename_part}.html"
-                        filename_lower = filename.lower()
-
-                        if "ch._holtz" in filename_lower or any(
-                            stichwort in filename_lower for stichwort in ausschluss_stichwoerter
-                        ):
+                    for pos in [(3, 4), (6, 7)]:
+                        fahrer_name = normalize_driver_name(row.iloc[pos[0]], row.iloc[pos[1]])
+                        if not fahrer_name:
                             continue
 
-                        html_code = generate_html(
-                            fahrer_name=fahrer_name,
-                            eintraege=wochen_eintraege,
-                            kw=kw,
-                            start_date=start_sonntag,
-                            css_styles=css_styles
+                        if fahrer_name not in fahrer_dict:
+                            fahrer_dict[fahrer_name] = {}
+
+                        if datum_dt is not None:
+                            tag = datum_dt.date()
+                            if tag not in fahrer_dict[fahrer_name]:
+                                fahrer_dict[fahrer_name][tag] = []
+
+                            if eintrag_text not in fahrer_dict[fahrer_name][tag]:
+                                fahrer_dict[fahrer_name][tag].append(eintrag_text)
+
+                if alle_gueltigen_daten:
+                    global_start_datum = min(alle_gueltigen_daten).date()
+                else:
+                    global_start_datum = pd.Timestamp.today().date()
+
+                global_start_sonntag = global_start_datum - pd.Timedelta(
+                    days=(global_start_datum.weekday() + 1) % 7
+                )
+                global_kw = get_kw(global_start_sonntag) + 1
+
+                fahrer_dict = dict(sorted(fahrer_dict.items(), key=lambda x: x[0].lower()))
+
+                for fahrer_name, eintraege in fahrer_dict.items():
+                    if eintraege:
+                        start_datum = min(eintraege.keys())
+                        start_sonntag = start_datum - pd.Timedelta(
+                            days=(start_datum.weekday() + 1) % 7
+                        )
+                        kw = get_kw(start_sonntag) + 1
+                    else:
+                        start_sonntag = global_start_sonntag
+                        kw = global_kw
+
+                    try:
+                        nachname, vorname = [s.strip() for s in fahrer_name.split(",", 1)]
+                    except ValueError:
+                        nachname, vorname = fahrer_name.strip(), ""
+
+                    n_clean = nachname.lower()
+                    v_clean = vorname.lower()
+
+                    filename_part = sonder_dateien.get(
+                        (n_clean, v_clean),
+                        nachname.replace(" ", "_")
+                    )
+
+                    alter_dateiname = f"KW{kw:02d}_{filename_part}.html"
+                    filename_lower = alter_dateiname.lower()
+
+                    if "ch._holtz" in filename_lower or any(
+                        stichwort in filename_lower for stichwort in ausschluss_stichwoerter
+                    ):
+                        continue
+
+                    fahrer_wochen.add((kw, filename_part))
+                    reihenfolge = 0
+
+                    for i in range(7):
+                        tag_datum = start_sonntag + pd.Timedelta(days=i)
+                        wochentag = wochentage_deutsch_map.get(
+                            tag_datum.strftime("%A"),
+                            tag_datum.strftime("%A")
                         )
 
-                        folder_name = f"KW{kw:02d}"
-                        full_path = os.path.join(tmpdir, folder_name, filename)
-                        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                        tag_eintraege = eintraege.get(tag_datum, [])
+                        if not tag_eintraege:
+                            tag_eintraege = ["– – –"]
 
-                        with open(full_path, "w", encoding="utf-8") as f:
-                            f.write(html_code)
+                        for eintrag in tag_eintraege:
+                            reihenfolge += 1
 
-                        zipf.write(full_path, arcname=os.path.join(folder_name, filename))
-                        erzeugte_dateien += 1
+                            if " – " in eintrag:
+                                uhrzeit_str, tour_str = eintrag.split(" – ", 1)
+                            else:
+                                uhrzeit_str, tour_str = "–", eintrag
+
+                            if not uhrzeit_str or uhrzeit_str.strip() == "–":
+                                uhrzeit_str = "–"
+                            if not tour_str or tour_str.strip() == "–":
+                                tour_str = "–"
+
+                            url = (
+                                f"dienstplan.html?kw={kw:02d}"
+                                f"&fahrer={quote(filename_part, safe='')}"
+                            )
+
+                            row_key = (
+                                kw,
+                                filename_part,
+                                fahrer_name,
+                                tag_datum.isoformat(),
+                                uhrzeit_str,
+                                tour_str,
+                            )
+                            if row_key in bekannte_zeilen:
+                                continue
+                            bekannte_zeilen.add(row_key)
+
+                            csv_rows.append({
+                                "kw": kw,
+                                "fahrer_key": filename_part,
+                                "fahrer_name": fahrer_name,
+                                "datum": tag_datum.isoformat(),
+                                "wochentag": wochentag,
+                                "uhrzeit": uhrzeit_str,
+                                "tour": tour_str,
+                                "reihenfolge": reihenfolge,
+                                "url": url,
+                            })
+
+            if not csv_rows:
+                st.warning("Es wurden keine Dienstplandaten erzeugt.")
+                st.stop()
+
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(generate_shared_html(css_styles))
+
+            csv_df = pd.DataFrame(csv_rows)
+            csv_df = csv_df.sort_values(
+                by=["kw", "fahrer_name", "reihenfolge"],
+                kind="stable"
+            )
+            csv_df.to_csv(
+                csv_path,
+                sep=";",
+                index=False,
+                encoding="utf-8-sig",
+                lineterminator="\n"
+            )
+
+            with ZipFile(zip_path, "w") as zipf:
+                zipf.write(html_path, arcname="dienstplan.html")
+                zipf.write(csv_path, arcname="dienstplaene.csv")
 
             with open(zip_path, "rb") as f:
                 zip_bytes = f.read()
@@ -967,11 +1153,17 @@ if uploaded_files:
 
             st.success(
                 f"{len(uploaded_files)} Datei(en) verarbeitet. "
-                f"{erzeugte_dateien} HTML-Datei(en) erstellt."
+                f"Eine HTML-Datei, eine CSV-Datei und "
+                f"{len(fahrer_wochen)} Fahrer-Woche(n) erstellt."
+            )
+
+            st.info(
+                "Aufruf künftig zum Beispiel: "
+                "dienstplan.html?kw=26&fahrer=Mueller"
             )
 
             st.download_button(
-                "ZIP mit allen HTML-Dateien herunterladen",
+                "ZIP mit HTML- und CSV-Datei herunterladen",
                 data=zip_bytes,
                 file_name="gesamt_export.zip",
                 mime="application/zip"
