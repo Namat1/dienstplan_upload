@@ -200,115 +200,193 @@ CSV_COLUMNS = [
 
 
 def download_existing_csv_from_ftp(local_path):
-    """Vorhandene dienstplaene.csv mit Zeitbegrenzung vom FTP laden.
+    """Vorhandene dienstplaene.csv eindeutig prüfen und robust laden.
 
-    Rückgabe: (status, meldung)
-    status ist "found", "missing" oder "error".
-
-    Wichtig:
-    - Die Datei wird zunächst als .part gespeichert.
-    - Ein blockierendes FTP-QUIT wird vermieden; die Verbindung wird direkt
-      geschlossen.
-    - Socket- und Gesamtzeit verhindern ein endloses Hängen.
+    Zuerst wird die Datei über den FTP-Steuerkanal mit SIZE geprüft. Fehlt sie,
+    kommt sofort der Status "missing". Ist sie vorhanden, wird zunächst im
+    passiven Modus geladen. Blockiert der Datenkanal, erfolgt automatisch ein
+    zweiter Versuch im aktiven Modus.
     """
-    ftp = None
     part_path = str(local_path) + ".part"
-    start_time = time.monotonic()
-    downloaded = 0
-    remote_size = None
+    remote_dir = (FTP_BASE_DIR or "/").replace("\\", "/").rstrip("/") or "/"
+    remote_display = (
+        f"{remote_dir}/dienstplaene.csv"
+        if remote_dir != "/"
+        else "/dienstplaene.csv"
+    )
 
-    try:
-        for path in (local_path, part_path):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
+    for path in (local_path, part_path):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
+    def connect_ftp(passive_mode):
         ftp = _new_ftp()
+        ftp.set_pasv(passive_mode)
 
-        # Sicherheitshalber auch nach dem Login den Socket-Timeout setzen.
         if getattr(ftp, "sock", None) is not None:
             ftp.sock.settimeout(FTP_TIMEOUT)
 
-        remote_dir = (FTP_BASE_DIR or "/").replace("\\", "/")
-        if remote_dir and remote_dir != "/":
+        if remote_dir != "/":
             ftp.cwd(remote_dir)
 
+        # SIZE funktioniert bei vielen Servern nur im Binärmodus.
         try:
-            remote_size = ftp.size("dienstplaene.csv")
-        except (*ftplib.all_errors, OSError):
-            remote_size = None
+            ftp.voidcmd("TYPE I")
+        except ftplib.all_errors:
+            pass
 
-        with open(part_path, "wb") as handle:
-            def write_block(block):
-                nonlocal downloaded
+        return ftp
 
-                elapsed = time.monotonic() - start_time
-                if elapsed > FTP_DOWNLOAD_MAX_SECONDS:
-                    raise TimeoutError(
-                        f"FTP-Download nach {FTP_DOWNLOAD_MAX_SECONDS} Sekunden abgebrochen."
+    def close_ftp(ftp):
+        if ftp is None:
+            return
+        try:
+            ftp.close()
+        except Exception:
+            pass
+
+    # 1) Existenz und Größe ausschließlich über den Steuerkanal prüfen.
+    probe = None
+    remote_size = None
+    try:
+        probe = connect_ftp(True)
+        try:
+            remote_size = probe.size("dienstplaene.csv")
+        except error_perm as exc:
+            if str(exc).lstrip().startswith("550"):
+                return (
+                    "missing",
+                    f"Nicht gefunden: {remote_display}. "
+                    "Bitte FTP_BASE_DIR und den exakten Dateinamen prüfen.",
+                )
+            raise
+
+        if remote_size is None:
+            # Manche Server unterstützen SIZE nicht. Mit MDTM wird wenigstens
+            # geprüft, ob die Datei angesprochen werden kann.
+            try:
+                probe.sendcmd("MDTM dienstplaene.csv")
+            except error_perm as exc:
+                if str(exc).lstrip().startswith("550"):
+                    return (
+                        "missing",
+                        f"Nicht gefunden: {remote_display}. "
+                        "Bitte FTP_BASE_DIR und den exakten Dateinamen prüfen.",
                     )
+                raise
 
-                handle.write(block)
-                downloaded += len(block)
-
-            ftp.retrbinary(
-                "RETR dienstplaene.csv",
-                write_block,
-                blocksize=64 * 1024,
-            )
-
-        elapsed = time.monotonic() - start_time
-
-        if not os.path.isfile(part_path) or os.path.getsize(part_path) == 0:
-            return "missing", "Die vorhandene dienstplaene.csv ist leer oder nicht vorhanden."
-
-        actual_size = os.path.getsize(part_path)
-        if remote_size is not None and int(remote_size) > 0 and actual_size != int(remote_size):
-            return (
-                "error",
-                "Der FTP-Download war unvollständig "
-                f"({actual_size:,} von {int(remote_size):,} Bytes).".replace(",", "."),
-            )
-
-        os.replace(part_path, local_path)
-
-        return (
-            "found",
-            f"Vorhandene dienstplaene.csv wurde in {elapsed:.1f} Sekunden geladen "
-            f"({actual_size / 1024 / 1024:.1f} MB).",
+        size_text = (
+            f"{int(remote_size) / 1024 / 1024:.2f} MB"
+            if remote_size is not None
+            else "Größe unbekannt"
         )
+        st.info(f"Datei gefunden: {remote_display} ({size_text}). Starte Download …")
 
     except error_perm as exc:
-        if str(exc).lstrip().startswith("550"):
-            return "missing", "Auf dem FTP-Server wurde noch keine dienstplaene.csv gefunden."
-        return "error", f"FTP-Zugriffsfehler beim Laden der vorhandenen CSV: {exc}"
-
+        return "error", f"FTP-Zugriffsfehler bei {remote_display}: {exc}"
     except (socket.timeout, TimeoutError) as exc:
         return (
             "error",
-            "Zeitüberschreitung beim FTP-Download. "
-            f"Der Server hat nicht innerhalb der erlaubten Zeit geantwortet: {exc}",
+            f"Schon die Prüfung von {remote_display} ist abgelaufen: {exc}",
         )
-
     except Exception as exc:
-        return "error", f"Vorhandene CSV konnte nicht vom FTP-Server geladen werden: {exc}"
-
+        return (
+            "error",
+            f"Die Datei konnte unter {remote_display} nicht geprüft werden: {exc}",
+        )
     finally:
-        # ftp.quit() kann bei manchen Servern nach einem erfolgreichen Transfer
-        # hängen. close() beendet die Verbindung ohne weitere Serverantwort.
-        if ftp is not None:
-            try:
-                ftp.close()
-            except Exception:
-                pass
+        close_ftp(probe)
+
+    # 2) Download zuerst passiv, danach als automatische Alternative aktiv.
+    errors = []
+
+    for passive_mode, mode_name in ((True, "passiv"), (False, "aktiv")):
+        ftp = None
+        downloaded = 0
+        start_time = time.monotonic()
 
         try:
-            if os.path.exists(part_path):
-                os.remove(part_path)
-        except OSError:
-            pass
+            try:
+                if os.path.exists(part_path):
+                    os.remove(part_path)
+            except OSError:
+                pass
+
+            st.info(f"FTP-Download im {mode_name}en Modus …")
+            ftp = connect_ftp(passive_mode)
+
+            with open(part_path, "wb") as handle:
+                def write_block(block):
+                    nonlocal downloaded
+
+                    elapsed = time.monotonic() - start_time
+                    if elapsed > FTP_DOWNLOAD_MAX_SECONDS:
+                        raise TimeoutError(
+                            f"{mode_name.capitalize()}er Download nach "
+                            f"{FTP_DOWNLOAD_MAX_SECONDS} Sekunden abgebrochen."
+                        )
+
+                    handle.write(block)
+                    downloaded += len(block)
+
+                ftp.retrbinary(
+                    "RETR dienstplaene.csv",
+                    write_block,
+                    blocksize=128 * 1024,
+                )
+
+            elapsed = time.monotonic() - start_time
+            actual_size = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+
+            if actual_size <= 0:
+                raise RuntimeError("Die heruntergeladene Datei ist leer.")
+
+            if (
+                remote_size is not None
+                and int(remote_size) > 0
+                and actual_size != int(remote_size)
+            ):
+                raise RuntimeError(
+                    "Der Download war unvollständig "
+                    f"({actual_size:,} von {int(remote_size):,} Bytes)."
+                    .replace(",", ".")
+                )
+
+            os.replace(part_path, local_path)
+
+            return (
+                "found",
+                f"Vorhandene CSV im {mode_name}en FTP-Modus geladen: "
+                f"{actual_size / 1024 / 1024:.2f} MB in {elapsed:.1f} Sekunden.",
+            )
+
+        except (socket.timeout, TimeoutError) as exc:
+            errors.append(f"{mode_name}: Zeitüberschreitung ({exc})")
+        except error_perm as exc:
+            if str(exc).lstrip().startswith("550"):
+                return (
+                    "missing",
+                    f"Die zuvor gefundene Datei ist nicht mehr vorhanden: {remote_display}.",
+                )
+            errors.append(f"{mode_name}: FTP-Fehler ({exc})")
+        except Exception as exc:
+            errors.append(f"{mode_name}: {exc}")
+        finally:
+            close_ftp(ftp)
+            try:
+                if os.path.exists(part_path):
+                    os.remove(part_path)
+            except OSError:
+                pass
+
+    return (
+        "error",
+        "Die Datei wurde gefunden, aber beide FTP-Datenmodi sind gescheitert. "
+        + " | ".join(errors),
+    )
 
 def read_dienstplan_csv(path):
     """Dienstplan-CSV robust lesen und auf das erwartete Schema bringen."""
