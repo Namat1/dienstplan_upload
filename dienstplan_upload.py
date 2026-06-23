@@ -13,7 +13,9 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from io import BytesIO
 from openpyxl import load_workbook
 from openpyxl.utils.datetime import from_excel
@@ -38,6 +40,8 @@ FTP_USE_TLS = os.getenv("FTP_TLS", "0") == "1"
 FTP_PARALLEL = int(os.getenv("FTP_PARALLEL", "3"))
 FTP_TIMEOUT = max(5, min(int(os.getenv("FTP_TIMEOUT", "15")), 30))
 FTP_DOWNLOAD_MAX_SECONDS = max(15, int(os.getenv("FTP_DOWNLOAD_MAX_SECONDS", "45")))
+DIENSTPLAN_CSV_URL = os.getenv("DIENSTPLAN_CSV_URL", "").strip()
+HTTP_DOWNLOAD_TIMEOUT = max(10, min(int(os.getenv("HTTP_DOWNLOAD_TIMEOUT", "30")), 120))
 
 # Deutsche Wochentage
 wochentage_deutsch_map = {
@@ -197,6 +201,183 @@ CSV_COLUMNS = [
     "kw", "fahrer_key", "fahrer_name", "datum", "wochentag",
     "uhrzeit", "tour", "reihenfolge", "url",
 ]
+
+
+
+def _url_mit_cachebuster(url):
+    """Ergänzt einen Zeitstempel, damit kein alter Web-Cache ausgeliefert wird."""
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["_dienstplan_ts"] = str(int(time.time()))
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(query),
+        parts.fragment,
+    ))
+
+
+def _csv_datei_sieht_gueltig_aus(path):
+    """Verhindert, dass versehentlich eine HTML-Fehler- oder Loginseite übernommen wird."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(8192)
+    except OSError:
+        return False, "Die heruntergeladene Datei konnte nicht gelesen werden."
+
+    if not head:
+        return False, "Die heruntergeladene Datei ist leer."
+
+    text_head = head.decode("utf-8-sig", errors="replace").lstrip()
+
+    if text_head.lower().startswith(("<!doctype html", "<html", "<?xml")):
+        return False, "Die Webadresse lieferte HTML statt der CSV-Datei."
+
+    first_line = text_head.splitlines()[0] if text_head.splitlines() else ""
+    required = ("kw", "fahrer_key", "fahrer_name", "datum")
+
+    if ";" not in first_line or not all(name in first_line for name in required):
+        return (
+            False,
+            "Die heruntergeladene Datei besitzt nicht den erwarteten "
+            "Dienstplan-CSV-Kopf.",
+        )
+
+    return True, ""
+
+
+def download_existing_csv_from_http(local_path):
+    """Lädt die bestehende Gesamt-CSV über HTTPS statt über den FTP-Datenkanal."""
+    if not DIENSTPLAN_CSV_URL:
+        return "not_configured", "Keine DIENSTPLAN_CSV_URL konfiguriert."
+
+    part_path = str(local_path) + ".http.part"
+    url = _url_mit_cachebuster(DIENSTPLAN_CSV_URL)
+    start_time = time.monotonic()
+    downloaded = 0
+
+    try:
+        for path in (local_path, part_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Dienstplan-Upload/1.0",
+                "Accept": "text/csv,text/plain;q=0.9,*/*;q=0.1",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
+            method="GET",
+        )
+
+        with urlopen(request, timeout=HTTP_DOWNLOAD_TIMEOUT) as response:
+            status_code = getattr(response, "status", 200)
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            content_length = response.headers.get("Content-Length")
+
+            if status_code != 200:
+                return "error", f"HTTPS-Abruf antwortete mit Status {status_code}."
+
+            with open(part_path, "wb") as handle:
+                while True:
+                    block = response.read(128 * 1024)
+                    if not block:
+                        break
+
+                    handle.write(block)
+                    downloaded += len(block)
+
+                    if downloaded > 100 * 1024 * 1024:
+                        raise RuntimeError(
+                            "Der HTTPS-Download ist unerwartet größer als 100 MB."
+                        )
+
+        if not os.path.isfile(part_path) or os.path.getsize(part_path) <= 0:
+            return "error", "Die über HTTPS geladene Datei ist leer."
+
+        valid, validation_message = _csv_datei_sieht_gueltig_aus(part_path)
+        if not valid:
+            return "error", validation_message
+
+        actual_size = os.path.getsize(part_path)
+
+        if content_length:
+            try:
+                expected_size = int(content_length)
+            except (TypeError, ValueError):
+                expected_size = None
+
+            if expected_size and actual_size != expected_size:
+                return (
+                    "error",
+                    "Der HTTPS-Download war unvollständig "
+                    f"({actual_size:,} von {expected_size:,} Bytes)."
+                    .replace(",", "."),
+                )
+
+        os.replace(part_path, local_path)
+        elapsed = time.monotonic() - start_time
+
+        return (
+            "found",
+            "Vorhandene CSV über HTTPS geladen: "
+            f"{actual_size / 1024 / 1024:.2f} MB in {elapsed:.1f} Sekunden.",
+        )
+
+    except HTTPError as exc:
+        if exc.code == 404:
+            return (
+                "missing",
+                f"Unter der Webadresse wurde keine dienstplaene.csv gefunden "
+                f"(HTTP 404): {DIENSTPLAN_CSV_URL}",
+            )
+        if exc.code in (401, 403):
+            return (
+                "error",
+                f"Der Webserver verweigert den Zugriff auf die CSV "
+                f"(HTTP {exc.code}).",
+            )
+        return "error", f"HTTPS-Fehler {exc.code}: {exc.reason}"
+
+    except (URLError, socket.timeout, TimeoutError) as exc:
+        return (
+            "error",
+            f"Zeitüberschreitung oder Verbindungsfehler beim HTTPS-Abruf: {exc}",
+        )
+
+    except Exception as exc:
+        return "error", f"Vorhandene CSV konnte nicht über HTTPS geladen werden: {exc}"
+
+    finally:
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except OSError:
+            pass
+
+
+def download_existing_csv(local_path):
+    """Lädt die vorhandene Gesamt-CSV ausschließlich über HTTPS.
+
+    FTP bleibt nur für den späteren Upload zuständig. Dadurch wird verhindert,
+    dass blockierte passive oder aktive FTP-Datenkanäle die Verarbeitung
+    minutenlang aufhalten.
+    """
+    if not DIENSTPLAN_CSV_URL:
+        return (
+            "error",
+            "DIENSTPLAN_CSV_URL fehlt in der .env. "
+            "Beispiel: https://DEINE-DOMAIN/test/uploads/2026/dienstplaene.csv",
+        )
+
+    st.info(f"Lade die vorhandene CSV über HTTPS: {DIENSTPLAN_CSV_URL}")
+    return download_existing_csv_from_http(local_path)
 
 
 def download_existing_csv_from_ftp(local_path):
@@ -1648,8 +1829,8 @@ if submitted:
             replaced_rows = 0
 
             if all([FTP_HOST, FTP_USER, FTP_PASS]):
-                status.info("Lade die vorhandene dienstplaene.csv vom FTP-Server …")
-                merge_status, merge_message = download_existing_csv_from_ftp(existing_csv_path)
+                status.info("Lade die vorhandene dienstplaene.csv …")
+                merge_status, merge_message = download_existing_csv(existing_csv_path)
 
                 if merge_status == "found":
                     status.info(merge_message)
