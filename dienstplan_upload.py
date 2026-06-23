@@ -62,6 +62,10 @@ FTP_USE_TLS = _conf("FTP_TLS", "0") == "1"
 FTP_PARALLEL = 1  # bewusst nur eine stabile FTP-Verbindung
 FTP_UPLOAD_RETRIES = max(1, min(int(_conf("FTP_UPLOAD_RETRIES", "3")), 5))
 FTP_TIMEOUT = max(20, min(int(_conf("FTP_TIMEOUT", "90")), 180))
+# Eigener, kürzerer Timeout je Upload-Versuch. Ein blockierter passiver
+# Datenkanal soll nicht 90 Sekunden hängen, sondern zügig in den nächsten
+# Modus (normal/korrigiert/aktiv) wechseln.
+FTP_TRANSFER_TIMEOUT = max(10, min(int(_conf("FTP_TRANSFER_TIMEOUT", "25")), 120))
 FTP_DOWNLOAD_MAX_SECONDS = max(15, int(_conf("FTP_DOWNLOAD_MAX_SECONDS", "45")))
 DIENSTPLAN_CSV_URL = (_conf("DIENSTPLAN_CSV_URL", "") or "").strip()
 HTTP_DOWNLOAD_TIMEOUT = max(10, min(int(_conf("HTTP_DOWNLOAD_TIMEOUT", "30")), 120))
@@ -114,23 +118,24 @@ class _FixedPassiveFTPTLS(_ControlHostPassiveMixin, FTP_TLS):
     pass
 
 
-def _new_ftp(force_control_host=True):
+def _new_ftp(force_control_host=True, passive=True, timeout=None):
     """Eine frische FTP(S)-Verbindung für einen einzelnen Transfer."""
+    verbindungs_timeout = timeout or FTP_TIMEOUT
     if FTP_USE_TLS:
         ftp = _FixedPassiveFTPTLS() if force_control_host else FTP_TLS()
     else:
         ftp = _FixedPassiveFTP() if force_control_host else FTP()
 
-    ftp.connect(FTP_HOST, 21, timeout=FTP_TIMEOUT)
+    ftp.connect(FTP_HOST, 21, timeout=verbindungs_timeout)
     ftp.login(FTP_USER, FTP_PASS)
 
     if getattr(ftp, "sock", None) is not None:
-        ftp.sock.settimeout(FTP_TIMEOUT)
+        ftp.sock.settimeout(verbindungs_timeout)
 
     if FTP_USE_TLS:
         ftp.prot_p()
 
-    ftp.set_pasv(True)
+    ftp.set_pasv(passive)
 
     try:
         ftp.voidcmd("TYPE I")
@@ -207,16 +212,19 @@ def upload_folder_to_ftp_with_progress(local_dir, ftp_dir, allowed_names=None):
         success = False
         attempt_errors = []
 
+        # Versuchsreihenfolge nach Erfolgswahrscheinlichkeit:
+        #  1) normaler Passivmodus  – unveränderte PASV-Antwort des Servers
+        #  2) korrigierter Passiv   – PASV-Host auf die Steuer-IP umgeschrieben
+        #  3) aktiver Modus (PORT)  – Server verbindet zurück (nur im LAN sinnvoll)
+        modi = [
+            ("normaler Passivmodus", dict(passive=True, force_control_host=False)),
+            ("korrigierter Passivmodus", dict(passive=True, force_control_host=True)),
+            ("aktiver Modus", dict(passive=False, force_control_host=False)),
+        ]
+
         for attempt in range(1, FTP_UPLOAD_RETRIES + 1):
             ftp = None
-            # Erster und dritter Versuch: PASV-Adresse korrigieren.
-            # Zweiter Versuch: unveränderte PASV-Antwort des Servers testen.
-            force_control_host = attempt != 2
-            mode_text = (
-                "korrigierter Passivmodus"
-                if force_control_host
-                else "normaler Passivmodus"
-            )
+            mode_text, mode_kwargs = modi[(attempt - 1) % len(modi)]
 
             try:
                 status_text.info(
@@ -224,7 +232,7 @@ def upload_folder_to_ftp_with_progress(local_dir, ftp_dir, allowed_names=None):
                     f"({mode_text}) …"
                 )
 
-                ftp = _new_ftp(force_control_host=force_control_host)
+                ftp = _new_ftp(timeout=FTP_TRANSFER_TIMEOUT, **mode_kwargs)
                 ensure_ftp_dirs(ftp, remote_dir, set())
                 ftp.cwd(remote_dir)
 
