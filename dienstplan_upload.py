@@ -1727,7 +1727,19 @@ def _arbeitsmappe_schnell_lesen(uploaded_file):
 
 st.set_page_config(page_title="Touren-Export", layout="centered")
 st.title("Dienstplan aktualisieren")
-st.caption("Die vorhandene CSV wird nicht heruntergeladen. Es werden nur Dienstpläne ""ab dem heutigen Datum neu erzeugt und auf dem Server ersetzt.")
+st.caption(
+    "Die vorhandene CSV wird nicht heruntergeladen. Es werden Dienstpläne "
+    "der letzten 30 Tage sowie alle zukünftigen Dienstpläne neu erzeugt."
+)
+
+if "dienstplan_export_dateien" not in st.session_state:
+    st.session_state.dienstplan_export_dateien = None
+if "dienstplan_export_zip" not in st.session_state:
+    st.session_state.dienstplan_export_zip = None
+if "dienstplan_export_info" not in st.session_state:
+    st.session_state.dienstplan_export_info = None
+if "dienstplan_ftp_erfolg" not in st.session_state:
+    st.session_state.dienstplan_ftp_erfolg = None
 
 with st.form("dienstplan_upload_form", clear_on_submit=False):
     uploaded_files = st.file_uploader(
@@ -1735,10 +1747,14 @@ with st.form("dienstplan_upload_form", clear_on_submit=False):
         type=["xlsx"],
         accept_multiple_files=True,
     )
-    auto_ftp = st.checkbox("Nach der Verarbeitung automatisch auf FTP hochladen", value=False)
     submitted = st.form_submit_button("Dienstpläne verarbeiten", type="primary")
 
 if submitted:
+    st.session_state.dienstplan_export_dateien = None
+    st.session_state.dienstplan_export_zip = None
+    st.session_state.dienstplan_export_info = None
+    st.session_state.dienstplan_ftp_erfolg = None
+
     if not uploaded_files:
         st.warning("Bitte mindestens eine Excel-Datei auswählen.")
         st.stop()
@@ -1749,7 +1765,6 @@ if submitted:
             html_path = os.path.join(tmpdir, "dienstplan_v4.html")
             js_path = os.path.join(tmpdir, "dienstplan_app_v4.js")
             csv_path = os.path.join(tmpdir, "dienstplaene.csv")
-            existing_csv_path = os.path.join(tmpdir, "dienstplaene_vorhanden.csv")
 
             ausschluss_stichwoerter = [
                 "zippel", "insel", "paasch", "meyer",
@@ -1960,16 +1975,77 @@ if submitted:
             with open(zip_path, "rb") as handle:
                 zip_bytes = handle.read()
 
-            ftp_upload_erfolgreich = None
+            export_dateien = {}
+            for dateiname, dateipfad in {
+                "dienstplan_v4.html": html_path,
+                "dienstplan_app_v4.js": js_path,
+                "dienstplaene.csv": csv_path,
+            }.items():
+                with open(dateipfad, "rb") as handle:
+                    export_dateien[dateiname] = handle.read()
 
-            if auto_ftp:
-                if not all([FTP_HOST, FTP_USER, FTP_PASS]):
-                    st.warning("FTP-Zugangsdaten fehlen in den Streamlit-Secrets.")
-                    ftp_upload_erfolgreich = False
-                else:
-                    status.info("Lade die drei Dateien auf den FTP-Server …")
-                    ftp_upload_erfolgreich = upload_folder_to_ftp_with_progress(
-                        tmpdir,
+            gesamt_dauer = time.perf_counter() - gesamt_start
+            info_text = (
+                f"{len(uploaded_files)} Datei(en) verarbeitet. "
+                f"{len(fahrer_wochen)} Fahrer-Woche(n) neu erstellt. "
+                f"Die neue CSV enthält {len(csv_df):,} Zeilen der letzten "
+                f"30 Tage und aller zukünftigen Dienstpläne."
+            ).replace(",", ".")
+
+            st.session_state.dienstplan_export_dateien = export_dateien
+            st.session_state.dienstplan_export_zip = zip_bytes
+            st.session_state.dienstplan_export_info = info_text
+            st.session_state.dienstplan_ftp_erfolg = None
+
+            status.success(f"Fertig nach {gesamt_dauer:.1f} Sekunden.")
+            st.success(info_text)
+
+    except Exception as exc:
+        st.exception(exc)
+
+# Die erzeugten Dateien bleiben über Streamlit-Neuläufe hinweg in der Sitzung.
+# Dadurch kann der FTP-Upload über einen eigenen Button gestartet werden.
+if st.session_state.dienstplan_export_dateien:
+    st.divider()
+    st.subheader("Erzeugte Dienstplandateien")
+
+    if st.session_state.dienstplan_export_info:
+        st.success(st.session_state.dienstplan_export_info)
+
+    button_spalte, download_spalte = st.columns(2)
+
+    with button_spalte:
+        ftp_upload_geklickt = st.button(
+            "Jetzt auf FTP hochladen",
+            type="primary",
+            use_container_width=True,
+        )
+
+    with download_spalte:
+        st.download_button(
+            "ZIP herunterladen",
+            data=st.session_state.dienstplan_export_zip,
+            file_name="gesamt_export.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+    if ftp_upload_geklickt:
+        if not all([FTP_HOST, FTP_USER, FTP_PASS]):
+            st.error("FTP-Zugangsdaten fehlen in den Streamlit-Secrets.")
+            st.session_state.dienstplan_ftp_erfolg = False
+        else:
+            try:
+                with tempfile.TemporaryDirectory() as upload_tmpdir:
+                    for dateiname, dateiinhalt in (
+                        st.session_state.dienstplan_export_dateien.items()
+                    ):
+                        dateipfad = os.path.join(upload_tmpdir, dateiname)
+                        with open(dateipfad, "wb") as handle:
+                            handle.write(dateiinhalt)
+
+                    upload_erfolgreich = upload_folder_to_ftp_with_progress(
+                        upload_tmpdir,
                         FTP_BASE_DIR,
                         allowed_names={
                             "dienstplan_v4.html",
@@ -1978,33 +2054,23 @@ if submitted:
                         },
                     )
 
-            gesamt_dauer = time.perf_counter() - gesamt_start
+                st.session_state.dienstplan_ftp_erfolg = upload_erfolgreich
 
-            if ftp_upload_erfolgreich is False:
-                status.warning(
-                    f"Dateien wurden nach {gesamt_dauer:.1f} Sekunden erzeugt, "
-                    "aber nicht vollständig auf den FTP-Server übertragen."
-                )
-            else:
-                status.success(f"Fertig nach {gesamt_dauer:.1f} Sekunden.")
+                if upload_erfolgreich:
+                    st.success(
+                        "Die drei Dienstplandateien wurden erfolgreich "
+                        "auf den FTP-Server hochgeladen."
+                    )
+                else:
+                    st.error(
+                        "Der FTP-Upload war nicht vollständig erfolgreich. "
+                        "Die erzeugten Dateien bleiben erhalten und können "
+                        "erneut hochgeladen werden."
+                    )
+            except Exception as exc:
+                st.session_state.dienstplan_ftp_erfolg = False
+                st.exception(exc)
 
-            wochen_text = ", ".join(
-                pd.Timestamp(woche).strftime("%d.%m.%Y")
-                for woche in sorted(hochgeladene_wochen)
-            )
-            st.success(
-                f"{len(uploaded_files)} Datei(en) verarbeitet. "
-                f"{len(fahrer_wochen)} Fahrer-Woche(n) neu erstellt. "
-                f"Die neue CSV enthält {len(csv_df):,} Zeilen ab den letzten 30 Tagen und ersetzt die Serverdatei vollständig."
-                .replace(",", ".")
-            )
+    elif st.session_state.dienstplan_ftp_erfolg is True:
+        st.success("Der letzte FTP-Upload war erfolgreich.")
 
-            st.download_button(
-                "ZIP mit HTML-, JavaScript- und CSV-Datei herunterladen",
-                data=zip_bytes,
-                file_name="gesamt_export.zip",
-                mime="application/zip",
-            )
-
-    except Exception as exc:
-        st.exception(exc)
