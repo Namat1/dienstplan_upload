@@ -465,8 +465,8 @@ def generate_shared_html(css_styles):
 </div>
 <div class="browser-safe-spacer" aria-hidden="true"></div>
 
-<script src="dienstplan_app.js?v=2" defer></script>
-<script src="../../../dienstplan.js" defer></script>
+<script src="dienstplan_app_v4.js?v=1" defer></script>
+
 </body>
 </html>'''
     return template.replace("__CSS_STYLES__", css_styles)
@@ -640,7 +640,7 @@ def generate_shared_js():
   if (!requestedKw || !requestedDriver) {
     showMessage(
       "Dienstplan nicht ausgewählt",
-      "Der Aufruf benötigt die Angaben kw und fahrer, zum Beispiel: dienstplan.html?kw=26&fahrer=Mueller"
+      "Der Aufruf benötigt die Angaben kw und fahrer, zum Beispiel: dienstplan_v4.html?kw=26&fahrer=Mueller"
     );
     return;
   }
@@ -1166,8 +1166,8 @@ if uploaded_files:
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, "gesamt_export.zip")
-            html_path = os.path.join(tmpdir, "dienstplan.html")
-            js_path = os.path.join(tmpdir, "dienstplan_app.js")
+            html_path = os.path.join(tmpdir, "dienstplan_v4.html")
+            js_path = os.path.join(tmpdir, "dienstplan_app_v4.js")
             csv_path = os.path.join(tmpdir, "dienstplaene.csv")
             existing_csv_path = os.path.join(tmpdir, "dienstplaene_vorhanden.csv")
 
@@ -1319,7 +1319,7 @@ if uploaded_files:
                                 tour_str = "–"
 
                             url = (
-                                f"dienstplan.html?kw={kw:02d}"
+                                f"dienstplan_v4.html?kw={kw:02d}"
                                 f"&fahrer={quote(filename_part, safe='')}"
                             )
 
@@ -1412,8 +1412,8 @@ if uploaded_files:
             )
 
             with ZipFile(zip_path, "w") as zipf:
-                zipf.write(html_path, arcname="dienstplan.html")
-                zipf.write(js_path, arcname="dienstplan_app.js")
+                zipf.write(html_path, arcname="dienstplan_v4.html")
+                zipf.write(js_path, arcname="dienstplan_app_v4.js")
                 zipf.write(csv_path, arcname="dienstplaene.csv")
 
             with open(zip_path, "rb") as f:
@@ -1428,8 +1428,8 @@ if uploaded_files:
                         tmpdir,
                         FTP_BASE_DIR,
                         allowed_names={
-                            "dienstplan.html",
-                            "dienstplan_app.js",
+                            "dienstplan_v4.html",
+                            "dienstplan_app_v4.js",
                             "dienstplaene.csv",
                         },
                     )
@@ -1459,7 +1459,7 @@ if uploaded_files:
 
             st.info(
                 "Aufruf künftig zum Beispiel: "
-                "dienstplan.html?kw=26&fahrer=Mueller"
+                "dienstplan_v4.html?kw=26&fahrer=Mueller"
             )
 
             st.download_button(
