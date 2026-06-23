@@ -33,17 +33,38 @@ warnings.filterwarnings(
 
 # .env laden
 load_dotenv()
-FTP_HOST = os.getenv("FTP_HOST")
-FTP_USER = os.getenv("FTP_USER")
-FTP_PASS = os.getenv("FTP_PASS")
-FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/")
-FTP_USE_TLS = os.getenv("FTP_TLS", "0") == "1"
+
+
+def _conf(name, default=None):
+    """Wert zuerst aus st.secrets, dann aus der Umgebung (.env) lesen.
+
+    Auf Streamlit-Deployments liegen die Zugangsdaten in st.secrets und nicht
+    in einer .env-Datei. Vorher wurden sie nur über os.getenv gesucht, sodass
+    FTP_HOST/USER/PASS leer blieben und der Upload mit dem Hinweis
+    "Zugangsdaten fehlen" abbrach, ohne überhaupt eine Verbindung zu starten.
+    """
+    try:
+        if name in st.secrets:
+            wert = st.secrets[name]
+            if wert is not None and str(wert) != "":
+                return str(wert)
+    except Exception:
+        # Keine secrets.toml vorhanden -> still auf die Umgebung zurückfallen.
+        pass
+    return os.getenv(name, default)
+
+
+FTP_HOST = _conf("FTP_HOST")
+FTP_USER = _conf("FTP_USER")
+FTP_PASS = _conf("FTP_PASS")
+FTP_BASE_DIR = _conf("FTP_BASE_DIR", "/")
+FTP_USE_TLS = _conf("FTP_TLS", "0") == "1"
 FTP_PARALLEL = 1  # bewusst nur eine stabile FTP-Verbindung
-FTP_UPLOAD_RETRIES = max(1, min(int(os.getenv("FTP_UPLOAD_RETRIES", "3")), 5))
-FTP_TIMEOUT = max(20, min(int(os.getenv("FTP_TIMEOUT", "90")), 180))
-FTP_DOWNLOAD_MAX_SECONDS = max(15, int(os.getenv("FTP_DOWNLOAD_MAX_SECONDS", "45")))
-DIENSTPLAN_CSV_URL = os.getenv("DIENSTPLAN_CSV_URL", "").strip()
-HTTP_DOWNLOAD_TIMEOUT = max(10, min(int(os.getenv("HTTP_DOWNLOAD_TIMEOUT", "30")), 120))
+FTP_UPLOAD_RETRIES = max(1, min(int(_conf("FTP_UPLOAD_RETRIES", "3")), 5))
+FTP_TIMEOUT = max(20, min(int(_conf("FTP_TIMEOUT", "90")), 180))
+FTP_DOWNLOAD_MAX_SECONDS = max(15, int(_conf("FTP_DOWNLOAD_MAX_SECONDS", "45")))
+DIENSTPLAN_CSV_URL = (_conf("DIENSTPLAN_CSV_URL", "") or "").strip()
+HTTP_DOWNLOAD_TIMEOUT = max(10, min(int(_conf("HTTP_DOWNLOAD_TIMEOUT", "30")), 120))
 
 # Deutsche Wochentage
 wochentage_deutsch_map = {
@@ -1728,8 +1749,9 @@ def _arbeitsmappe_schnell_lesen(uploaded_file):
 st.set_page_config(page_title="Touren-Export", layout="centered")
 st.title("Dienstplan aktualisieren")
 st.caption(
-    "Die vorhandene CSV wird nicht heruntergeladen. Es werden Dienstpläne "
-    "der letzten 30 Tage sowie alle zukünftigen Dienstpläne neu erzeugt."
+    "Die vorhandene CSV wird nicht heruntergeladen. Es werden alle in den "
+    "hochgeladenen Dateien enthaltenen Dienstpläne ausgelesen und die "
+    "Server-CSV wird vollständig ersetzt."
 )
 
 if "dienstplan_export_dateien" not in st.session_state:
@@ -1925,37 +1947,20 @@ if submitted:
                 handle.write(generate_shared_js())
 
             status.info("Bereinige die neu erzeugten Dienstplandaten …")
-            new_csv_df = clean_and_sort_csv(pd.DataFrame(csv_rows))
-
-            # Es wird bewusst keine vorhandene CSV mehr geladen.
-            # Die neue Datei enthält Termine ab heute minus 30 Tage
-            # in deutscher Ortszeit und ersetzt die Serverdatei vollständig.
-            heute_berlin = datetime.now(ZoneInfo("Europe/Berlin")).date()
-            grenzdatum = heute_berlin - pd.Timedelta(days=30)
-            datum_werte = pd.to_datetime(
-                new_csv_df["datum"],
-                errors="coerce",
-            ).dt.date
-
-            csv_df = new_csv_df.loc[
-                datum_werte.notna() & (datum_werte >= grenzdatum)
-            ].copy()
-            csv_df = clean_and_sort_csv(csv_df)
+            # Alle Pläne aus den hochgeladenen Dateien werden übernommen.
+            # Es wird keine vorhandene CSV geladen und kein Datumsfenster mehr
+            # angewendet: Die neue Datei enthält sämtliche ausgelesenen
+            # Dienstpläne und ersetzt die Serverdatei immer vollständig.
+            csv_df = clean_and_sort_csv(pd.DataFrame(csv_rows))
 
             if csv_df.empty:
                 st.error(
-                    "In den hochgeladenen Dateien wurden keine Dienstpläne ab "
-                    f"{grenzdatum.strftime('%d.%m.%Y')} gefunden."
+                    "In den hochgeladenen Dateien wurden keine Dienstpläne gefunden."
                 )
                 st.stop()
 
-            entfernte_zeilen = len(new_csv_df) - len(csv_df)
             status.info(
-                f"Übernehme {len(csv_df):,} Zeilen ab "
-                f"{grenzdatum.strftime('%d.%m.%Y')} "
-                f"(letzte 30 Tage bis Zukunft). "
-                f"{entfernte_zeilen:,} ältere Zeilen wurden weggelassen."
-                .replace(",", ".")
+                f"Übernehme alle {len(csv_df):,} ausgelesenen Zeilen.".replace(",", ".")
             )
 
             csv_df.to_csv(
@@ -1988,8 +1993,7 @@ if submitted:
             info_text = (
                 f"{len(uploaded_files)} Datei(en) verarbeitet. "
                 f"{len(fahrer_wochen)} Fahrer-Woche(n) neu erstellt. "
-                f"Die neue CSV enthält {len(csv_df):,} Zeilen der letzten "
-                f"30 Tage und aller zukünftigen Dienstpläne."
+                f"Die neue CSV enthält alle {len(csv_df):,} ausgelesenen Zeilen."
             ).replace(",", ".")
 
             st.session_state.dienstplan_export_dateien = export_dateien
@@ -2032,7 +2036,10 @@ if st.session_state.dienstplan_export_dateien:
 
     if ftp_upload_geklickt:
         if not all([FTP_HOST, FTP_USER, FTP_PASS]):
-            st.error("FTP-Zugangsdaten fehlen in den Streamlit-Secrets.")
+            st.error(
+                "FTP-Zugangsdaten fehlen. Bitte FTP_HOST, FTP_USER und "
+                "FTP_PASS in den Streamlit-Secrets oder in der .env hinterlegen."
+            )
             st.session_state.dienstplan_ftp_erfolg = False
         else:
             try:
