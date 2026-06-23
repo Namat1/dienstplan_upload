@@ -7,7 +7,6 @@ import os
 import time
 import ftplib
 import threading
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
@@ -33,15 +32,8 @@ wochentage_deutsch_map = {
     "Sunday": "Sonntag"
 }
 
-def get_plan_kw(start_sonntag):
-    """Kalenderwoche der Planwoche Sonntag bis Samstag.
-
-    Maßgeblich ist der Montag innerhalb dieser Planwoche. Dadurch wird
-    der Jahreswechsel korrekt behandelt: 28.12.2025 bis 03.01.2026
-    gehört zur Kalenderwoche 01/2026 und nicht zu Kalenderwoche 53.
-    """
-    montag = pd.Timestamp(start_sonntag) + pd.Timedelta(days=1)
-    return int(montag.isocalendar().week)
+def get_kw(datum):
+    return datum.isocalendar()[1]
 
 def _new_ftp():
     """Eine frische, eingeloggte FTP(S)-Verbindung im Passive-Mode."""
@@ -173,41 +165,13 @@ def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
         )
 
 def normalize_driver_name(nachname, vorname):
-    """Fahrernamen bereinigen; leere Excel-Zellen können als 0/0.0 erscheinen."""
-    def clean_part(value):
-        if pd.isna(value):
-            return ""
+    nachname = str(nachname).strip().title() if pd.notna(nachname) else ""
+    vorname = str(vorname).strip().title() if pd.notna(vorname) else ""
 
-        value_str = str(value).strip()
-        value_lower = value_str.lower()
+    if not nachname and not vorname:
+        return ""
 
-        if value_lower in {"", "nan", "none", "null", "nat", "-", "–"}:
-            return ""
-        if re.fullmatch(r"0+(?:[.,]0+)?", value_str):
-            return ""
-
-        return value_str.title()
-
-    nachname = clean_part(nachname)
-    vorname = clean_part(vorname)
-
-    # Bekannte Schreibvarianten aus unterschiedlichen Excel-Dateien
-    # auf eine einheitliche Fahreridentität zusammenführen.
-    alias = {
-        ("khalleefah", ""): ("Khalleefah", "Saed Awami Sayid"),
-        ("alem", "mohamed"): ("Alem", "Mohammed"),
-        ("maghraoui", "zakaria"): ("Maghraoui", "Zakariae"),
-    }.get((nachname.casefold(), vorname.casefold()))
-    if alias:
-        nachname, vorname = alias
-
-    if nachname and vorname:
-        return f"{nachname}, {vorname}"
-    if nachname:
-        return nachname
-    if vorname:
-        return vorname
-    return ""
+    return f"{nachname}, {vorname}".strip().strip(",")
 
 def parse_uhrzeit(uhrzeit):
     if pd.isna(uhrzeit):
@@ -239,7 +203,7 @@ def parse_tour(tour):
     return tour_str
 
 def generate_shared_html(css_styles):
-    """Erzeugt eine CSP-konforme HTML-Datei ohne eingebettetes JavaScript."""
+    """Erzeugt genau eine gemeinsame HTML-Datei, die ihre Daten aus CSV lädt."""
     template = r'''<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -254,7 +218,7 @@ def generate_shared_html(css_styles):
 <body>
 <div class="container-outer">
   <div class="back-bar">
-    <a href="../../../plane.php" class="btn-back" id="btnBack">
+    <a href="plane.php" class="btn-back" id="btnBack">
       <span class="btn-back-arrow" aria-hidden="true">‹</span>
       <span>Zurück</span>
     </a>
@@ -283,16 +247,8 @@ def generate_shared_html(css_styles):
 </div>
 <div class="browser-safe-spacer" aria-hidden="true"></div>
 
-<script src="dienstplan_app.js?v=2" defer></script>
-<script src="../../../dienstplan.js" defer></script>
-</body>
-</html>'''
-    return template.replace("__CSS_STYLES__", css_styles)
-
-
-def generate_shared_js():
-    """JavaScript der gemeinsamen Dienstplanseite als externe Datei."""
-    return r'''(function () {
+<script>
+(function () {
   "use strict";
 
   const params = new URLSearchParams(window.location.search);
@@ -503,7 +459,11 @@ def generate_shared_js():
       showMessage("Fehler beim Laden", error.message);
     });
 })();
-'''
+</script>
+<script src="dienstplan.js"></script>
+</body>
+</html>'''
+    return template.replace("__CSS_STYLES__", css_styles)
 
 
 css_styles = """
@@ -985,7 +945,6 @@ if uploaded_files:
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, "gesamt_export.zip")
             html_path = os.path.join(tmpdir, "dienstplan.html")
-            js_path = os.path.join(tmpdir, "dienstplan_app.js")
             csv_path = os.path.join(tmpdir, "dienstplaene.csv")
 
             ausschluss_stichwoerter = [
@@ -1007,10 +966,6 @@ if uploaded_files:
                 ("schulz", "stephan"): "STSchulz",
                 ("lewandowski", "kamil"): "Lewandowski",
                 ("lewandowski", "dominik"): "DLewandowski",
-                # Zwei verschiedene Fahrer mit gleichem Nachnamen:
-                # Rene behält aus Kompatibilitätsgründen den bisherigen Schlüssel.
-                ("schlutt", "rene"): "Schlutt",
-                ("schlutt", "hubert"): "HSchlutt",
             }
 
             csv_rows = []
@@ -1070,7 +1025,7 @@ if uploaded_files:
                 global_start_sonntag = global_start_datum - pd.Timedelta(
                     days=(global_start_datum.weekday() + 1) % 7
                 )
-                global_kw = get_plan_kw(global_start_sonntag)
+                global_kw = get_kw(global_start_sonntag) + 1
 
                 fahrer_dict = dict(sorted(fahrer_dict.items(), key=lambda x: x[0].lower()))
 
@@ -1080,7 +1035,7 @@ if uploaded_files:
                         start_sonntag = start_datum - pd.Timedelta(
                             days=(start_datum.weekday() + 1) % 7
                         )
-                        kw = get_plan_kw(start_sonntag)
+                        kw = get_kw(start_sonntag) + 1
                     else:
                         start_sonntag = global_start_sonntag
                         kw = global_kw
@@ -1169,54 +1124,11 @@ if uploaded_files:
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(generate_shared_html(css_styles))
 
-            with open(js_path, "w", encoding="utf-8") as f:
-                f.write(generate_shared_js())
-
             csv_df = pd.DataFrame(csv_rows)
-
-            # Bei überlappenden Quelldateien können für denselben Fahrer und Tag
-            # sowohl ein echter Eintrag als auch ein leerer Platzhalter entstehen.
-            # Der Platzhalter wird dann entfernt; mehrere echte Aufgaben bleiben erhalten.
-            csv_df = csv_df.drop_duplicates(
-                subset=[
-                    "kw", "fahrer_key", "fahrer_name", "datum",
-                    "wochentag", "uhrzeit", "tour"
-                ],
-                keep="first"
-            ).copy()
-
-            ist_leer = (
-                csv_df["uhrzeit"].astype(str).str.strip().isin(["", "–"])
-                & csv_df["tour"].astype(str).str.strip().isin(["", "–"])
-            )
-            hat_echten_eintrag = (~ist_leer).groupby([
-                csv_df["kw"],
-                csv_df["fahrer_key"],
-                csv_df["datum"],
-            ]).transform("any")
-            csv_df = csv_df.loc[~(ist_leer & hat_echten_eintrag)].copy()
-
-            csv_df["_datum_sort"] = pd.to_datetime(
-                csv_df["datum"], errors="coerce"
-            )
-            csv_df["_reihenfolge_alt"] = pd.to_numeric(
-                csv_df["reihenfolge"], errors="coerce"
-            ).fillna(9999)
-
             csv_df = csv_df.sort_values(
-                by=[
-                    "kw", "fahrer_name", "_datum_sort",
-                    "_reihenfolge_alt"
-                ],
+                by=["kw", "fahrer_name", "reihenfolge"],
                 kind="stable"
             )
-            csv_df["reihenfolge"] = (
-                csv_df.groupby(["kw", "fahrer_key"]).cumcount() + 1
-            )
-            csv_df = csv_df.drop(
-                columns=["_datum_sort", "_reihenfolge_alt"]
-            )
-
             csv_df.to_csv(
                 csv_path,
                 sep=";",
@@ -1227,7 +1139,6 @@ if uploaded_files:
 
             with ZipFile(zip_path, "w") as zipf:
                 zipf.write(html_path, arcname="dienstplan.html")
-                zipf.write(js_path, arcname="dienstplan_app.js")
                 zipf.write(csv_path, arcname="dienstplaene.csv")
 
             with open(zip_path, "rb") as f:
@@ -1242,7 +1153,7 @@ if uploaded_files:
 
             st.success(
                 f"{len(uploaded_files)} Datei(en) verarbeitet. "
-                f"Eine HTML-Datei, eine JavaScript-Datei, eine CSV-Datei und "
+                f"Eine HTML-Datei, eine CSV-Datei und "
                 f"{len(fahrer_wochen)} Fahrer-Woche(n) erstellt."
             )
 
@@ -1252,7 +1163,7 @@ if uploaded_files:
             )
 
             st.download_button(
-                "ZIP mit HTML-, JavaScript- und CSV-Datei herunterladen",
+                "ZIP mit HTML- und CSV-Datei herunterladen",
                 data=zip_bytes,
                 file_name="gesamt_export.zip",
                 mime="application/zip"
