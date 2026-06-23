@@ -38,8 +38,9 @@ FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/")
 FTP_USE_TLS = os.getenv("FTP_TLS", "0") == "1"
-FTP_PARALLEL = int(os.getenv("FTP_PARALLEL", "3"))
-FTP_TIMEOUT = max(5, min(int(os.getenv("FTP_TIMEOUT", "15")), 30))
+FTP_PARALLEL = 1  # bewusst nur eine stabile FTP-Verbindung
+FTP_UPLOAD_RETRIES = max(1, min(int(os.getenv("FTP_UPLOAD_RETRIES", "3")), 5))
+FTP_TIMEOUT = max(20, min(int(os.getenv("FTP_TIMEOUT", "90")), 180))
 FTP_DOWNLOAD_MAX_SECONDS = max(15, int(os.getenv("FTP_DOWNLOAD_MAX_SECONDS", "45")))
 DIENSTPLAN_CSV_URL = os.getenv("DIENSTPLAN_CSV_URL", "").strip()
 HTTP_DOWNLOAD_TIMEOUT = max(10, min(int(os.getenv("HTTP_DOWNLOAD_TIMEOUT", "30")), 120))
@@ -65,14 +66,56 @@ def get_plan_kw(start_sonntag):
     montag = pd.Timestamp(start_sonntag) + pd.Timedelta(days=1)
     return int(montag.isocalendar().week)
 
-def _new_ftp():
-    """Eine frische, eingeloggte FTP(S)-Verbindung im Passive-Mode."""
-    ftp = FTP_TLS() if FTP_USE_TLS else FTP()
+class _ControlHostPassiveMixin:
+    """Verwendet beim PASV-Datenkanal die Adresse der Steuerverbindung.
+
+    Manche FTP-Server liefern in der PASV-Antwort eine interne oder für
+    Streamlit nicht erreichbare Adresse. FileZilla korrigiert das automatisch;
+    ftplib normalerweise nicht.
+    """
+
+    def makepasv(self):
+        host, port = super().makepasv()
+        try:
+            peer_host = self.sock.getpeername()[0]
+            if peer_host:
+                host = peer_host
+        except Exception:
+            pass
+        return host, port
+
+
+class _FixedPassiveFTP(_ControlHostPassiveMixin, FTP):
+    pass
+
+
+class _FixedPassiveFTPTLS(_ControlHostPassiveMixin, FTP_TLS):
+    pass
+
+
+def _new_ftp(force_control_host=True):
+    """Eine frische FTP(S)-Verbindung für einen einzelnen Transfer."""
+    if FTP_USE_TLS:
+        ftp = _FixedPassiveFTPTLS() if force_control_host else FTP_TLS()
+    else:
+        ftp = _FixedPassiveFTP() if force_control_host else FTP()
+
     ftp.connect(FTP_HOST, 21, timeout=FTP_TIMEOUT)
     ftp.login(FTP_USER, FTP_PASS)
+
+    if getattr(ftp, "sock", None) is not None:
+        ftp.sock.settimeout(FTP_TIMEOUT)
+
     if FTP_USE_TLS:
         ftp.prot_p()
+
     ftp.set_pasv(True)
+
+    try:
+        ftp.voidcmd("TYPE I")
+    except ftplib.all_errors:
+        pass
+
     return ftp
 
 def ensure_ftp_dirs(ftp, remote_dir, created_cache):
@@ -95,107 +138,151 @@ def ensure_ftp_dirs(ftp, remote_dir, created_cache):
     created_cache.add(remote_dir)
 
 def upload_folder_to_ftp_with_progress(local_dir, ftp_dir, allowed_names=None):
-    # Dateien sammeln. Optional nur die ausdrücklich freigegebenen Dateien
-    # hochladen, damit lokale Hilfs- und ZIP-Dateien nicht auf dem Server landen.
+    """Lädt die Dateien nacheinander und mit Wiederholungen hoch.
+
+    Es werden temporäre Dateinamen verwendet. Erst nach einem vollständigen
+    Transfer wird die Serverdatei ersetzt. Die Funktion gibt True bei einem
+    vollständigen Upload zurück.
+    """
     all_files = []
+
     for root, _, files in os.walk(local_dir):
         for file in files:
             if allowed_names is not None and file not in allowed_names:
                 continue
+
             local_path = os.path.join(root, file)
             rel_path = os.path.relpath(local_path, local_dir).replace("\\", "/")
             remote_path = os.path.join(ftp_dir, rel_path).replace("\\", "/")
             all_files.append((local_path, remote_path))
 
+    # Statische Dateien zuerst, die Daten-CSV zuletzt ersetzen.
+    priority = {
+        "dienstplan_v4.html": 1,
+        "dienstplan_app_v4.js": 2,
+        "dienstplaene.csv": 3,
+    }
+    all_files.sort(
+        key=lambda item: (
+            priority.get(os.path.basename(item[1]), 99),
+            item[1].lower(),
+        )
+    )
+
     total = len(all_files)
     if total == 0:
         st.warning("Keine Dateien zum Hochladen gefunden.")
-        return
+        return False
 
     progress_bar = st.progress(0)
     status_text = st.empty()
-    t0 = time.perf_counter()
-
-    # 1) Alle Zielverzeichnisse EINMAL vorab anlegen (eine Verbindung).
-    #    Danach müssen die Worker nur noch STOR machen, kein mkd.
-    status_text.info("Lege Verzeichnisse an ...")
-    setup = _new_ftp()
-    created = set()
-    try:
-        for _, remote_path in all_files:
-            ensure_ftp_dirs(setup, os.path.dirname(remote_path), created)
-    finally:
-        try:
-            setup.quit()
-        except (*ftplib.all_errors, OSError):
-            setup.close()
-
-    # 2) Dateien parallel hochladen. Jeder Worker-Thread hält seine eigene
-    #    FTP-Verbindung (thread-local) und nutzt sie für alle seine Dateien wieder.
-    tl = threading.local()
-    conns = []
-    conns_lock = threading.Lock()
-
-    def get_conn():
-        ftp = getattr(tl, "ftp", None)
-        if ftp is None:
-            ftp = _new_ftp()
-            tl.ftp = ftp
-            tl.cwd = None
-            with conns_lock:
-                conns.append(ftp)
-        return ftp
-
-    def upload_one(item):
-        local_path, remote_path = item
-        ftp = get_conn()
-        remote_dir = os.path.dirname(remote_path).replace("\\", "/")
-        # cwd pro Verbindung nur wechseln, wenn nötig
-        if tl.cwd != remote_dir:
-            ftp.cwd(remote_dir)
-            tl.cwd = remote_dir
-        with open(local_path, "rb") as f:
-            ftp.storbinary(f"STOR {os.path.basename(remote_path)}", f)
-
-    workers = max(1, min(FTP_PARALLEL, total))
-    uploaded = 0
+    started = time.perf_counter()
     errors = []
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(upload_one, it): it for it in all_files}
-        for fut in as_completed(futures):
-            local_path, remote_path = futures[fut]
-            try:
-                fut.result()
-            except Exception as e:
-                errors.append((os.path.basename(remote_path), str(e)))
-            uploaded += 1
-            progress_bar.progress(uploaded / total)
-            status_text.info(f"Hochgeladen: {uploaded}/{total}")
+    for index, (local_path, remote_path) in enumerate(all_files, start=1):
+        filename = os.path.basename(remote_path)
+        remote_dir = os.path.dirname(remote_path).replace("\\", "/")
+        local_size = os.path.getsize(local_path)
+        success = False
+        attempt_errors = []
 
-    # 3) Alle Worker-Verbindungen schließen
-    for ftp in conns:
-        try:
-            ftp.quit()
-        except (*ftplib.all_errors, OSError):
-            try:
-                ftp.close()
-            except Exception:
-                pass
+        for attempt in range(1, FTP_UPLOAD_RETRIES + 1):
+            ftp = None
+            # Erster und dritter Versuch: PASV-Adresse korrigieren.
+            # Zweiter Versuch: unveränderte PASV-Antwort des Servers testen.
+            force_control_host = attempt != 2
+            mode_text = (
+                "korrigierter Passivmodus"
+                if force_control_host
+                else "normaler Passivmodus"
+            )
 
-    dauer = time.perf_counter() - t0
-    ok = total - len(errors)
+            try:
+                status_text.info(
+                    f"{filename}: Versuch {attempt}/{FTP_UPLOAD_RETRIES} "
+                    f"({mode_text}) …"
+                )
+
+                ftp = _new_ftp(force_control_host=force_control_host)
+                ensure_ftp_dirs(ftp, remote_dir, set())
+                ftp.cwd(remote_dir)
+
+                temp_name = filename + ".uploading"
+
+                try:
+                    ftp.delete(temp_name)
+                except error_perm as exc:
+                    if not str(exc).lstrip().startswith("550"):
+                        raise
+
+                with open(local_path, "rb") as handle:
+                    ftp.storbinary(
+                        f"STOR {temp_name}",
+                        handle,
+                        blocksize=128 * 1024,
+                    )
+
+                # Größenkontrolle, soweit der Server SIZE unterstützt.
+                remote_size = None
+                try:
+                    ftp.voidcmd("TYPE I")
+                    remote_size = ftp.size(temp_name)
+                except ftplib.all_errors:
+                    remote_size = None
+
+                if remote_size is not None and int(remote_size) != int(local_size):
+                    raise RuntimeError(
+                        f"Größenprüfung fehlgeschlagen: lokal {local_size} Bytes, "
+                        f"Server {remote_size} Bytes."
+                    )
+
+                # Erst jetzt die aktive Datei ersetzen.
+                try:
+                    ftp.delete(filename)
+                except error_perm as exc:
+                    if not str(exc).lstrip().startswith("550"):
+                        raise
+
+                ftp.rename(temp_name, filename)
+                success = True
+                break
+
+            except Exception as exc:
+                attempt_errors.append(
+                    f"Versuch {attempt} ({mode_text}): {exc}"
+                )
+                time.sleep(min(2 * attempt, 5))
+
+            finally:
+                if ftp is not None:
+                    try:
+                        ftp.close()
+                    except Exception:
+                        pass
+
+        if not success:
+            errors.append((filename, " | ".join(attempt_errors)))
+
+        progress_bar.progress(index / total)
+
+    duration = time.perf_counter() - started
+    uploaded_count = total - len(errors)
+
     if errors:
-        status_text.warning(
-            f"{ok}/{total} hochgeladen, {len(errors)} Fehler "
-            f"in {dauer:.1f}s ({workers} parallele Verbindungen)."
+        status_text.error(
+            f"{uploaded_count}/{total} hochgeladen, {len(errors)} Fehler "
+            f"in {duration:.1f} Sekunden."
         )
-        st.code("\n".join(f"{n}: {e}" for n, e in errors[:10]))
-    else:
-        status_text.success(
-            f"Alle {total} Dateien in {dauer:.1f}s hochgeladen "
-            f"({workers} parallele Verbindungen, Ø {dauer / total:.2f}s/Datei)."
+        st.code(
+            "\n\n".join(f"{name}:\n{error}" for name, error in errors)
         )
+        return False
+
+    status_text.success(
+        f"Alle {total} Dateien in {duration:.1f} Sekunden hochgeladen "
+        f"(eine stabile Verbindung je Datei)."
+    )
+    return True
 
 
 CSV_COLUMNS = [
@@ -1873,12 +1960,15 @@ if submitted:
             with open(zip_path, "rb") as handle:
                 zip_bytes = handle.read()
 
+            ftp_upload_erfolgreich = None
+
             if auto_ftp:
                 if not all([FTP_HOST, FTP_USER, FTP_PASS]):
-                    st.warning("FTP-Zugangsdaten fehlen in der .env-Datei.")
+                    st.warning("FTP-Zugangsdaten fehlen in den Streamlit-Secrets.")
+                    ftp_upload_erfolgreich = False
                 else:
                     status.info("Lade die drei Dateien auf den FTP-Server …")
-                    upload_folder_to_ftp_with_progress(
+                    ftp_upload_erfolgreich = upload_folder_to_ftp_with_progress(
                         tmpdir,
                         FTP_BASE_DIR,
                         allowed_names={
@@ -1889,7 +1979,14 @@ if submitted:
                     )
 
             gesamt_dauer = time.perf_counter() - gesamt_start
-            status.success(f"Fertig nach {gesamt_dauer:.1f} Sekunden.")
+
+            if ftp_upload_erfolgreich is False:
+                status.warning(
+                    f"Dateien wurden nach {gesamt_dauer:.1f} Sekunden erzeugt, "
+                    "aber nicht vollständig auf den FTP-Server übertragen."
+                )
+            else:
+                status.success(f"Fertig nach {gesamt_dauer:.1f} Sekunden.")
 
             wochen_text = ", ".join(
                 pd.Timestamp(woche).strftime("%d.%m.%Y")
@@ -1901,14 +1998,6 @@ if submitted:
                 f"Die neue CSV enthält {len(csv_df):,} Zeilen ab den letzten 30 Tagen und ersetzt die Serverdatei vollständig."
                 .replace(",", ".")
             )
-
-            if existing_csv_df is not None:
-                st.info(
-                    f"Ersetzte Planwoche(n), jeweils ab Sonntag: {wochen_text}. "
-                    f"{replaced_rows:,} alte Zeilen wurden ersetzt und "
-                    f"{retained_rows:,} Zeilen aus anderen Wochen beibehalten."
-                    .replace(",", ".")
-                )
 
             st.download_button(
                 "ZIP mit HTML-, JavaScript- und CSV-Datei herunterladen",
