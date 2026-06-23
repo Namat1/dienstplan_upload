@@ -184,6 +184,16 @@ def normalize_driver_name(nachname, vorname):
     nachname = clean_part(nachname)
     vorname = clean_part(vorname)
 
+    # Bekannte Schreibvarianten aus unterschiedlichen Excel-Dateien
+    # auf eine einheitliche Fahreridentität zusammenführen.
+    alias = {
+        ("khalleefah", ""): ("Khalleefah", "Saed Awami Sayid"),
+        ("alem", "mohamed"): ("Alem", "Mohammed"),
+        ("maghraoui", "zakaria"): ("Maghraoui", "Zakariae"),
+    }.get((nachname.casefold(), vorname.casefold()))
+    if alias:
+        nachname, vorname = alias
+
     if nachname and vorname:
         return f"{nachname}, {vorname}"
     if nachname:
@@ -985,6 +995,10 @@ if uploaded_files:
                 ("schulz", "stephan"): "STSchulz",
                 ("lewandowski", "kamil"): "Lewandowski",
                 ("lewandowski", "dominik"): "DLewandowski",
+                # Zwei verschiedene Fahrer mit gleichem Nachnamen:
+                # Rene behält aus Kompatibilitätsgründen den bisherigen Schlüssel.
+                ("schlutt", "rene"): "Schlutt",
+                ("schlutt", "hubert"): "HSchlutt",
             }
 
             csv_rows = []
@@ -1144,10 +1158,50 @@ if uploaded_files:
                 f.write(generate_shared_html(css_styles))
 
             csv_df = pd.DataFrame(csv_rows)
+
+            # Bei überlappenden Quelldateien können für denselben Fahrer und Tag
+            # sowohl ein echter Eintrag als auch ein leerer Platzhalter entstehen.
+            # Der Platzhalter wird dann entfernt; mehrere echte Aufgaben bleiben erhalten.
+            csv_df = csv_df.drop_duplicates(
+                subset=[
+                    "kw", "fahrer_key", "fahrer_name", "datum",
+                    "wochentag", "uhrzeit", "tour"
+                ],
+                keep="first"
+            ).copy()
+
+            ist_leer = (
+                csv_df["uhrzeit"].astype(str).str.strip().isin(["", "–"])
+                & csv_df["tour"].astype(str).str.strip().isin(["", "–"])
+            )
+            hat_echten_eintrag = (~ist_leer).groupby([
+                csv_df["kw"],
+                csv_df["fahrer_key"],
+                csv_df["datum"],
+            ]).transform("any")
+            csv_df = csv_df.loc[~(ist_leer & hat_echten_eintrag)].copy()
+
+            csv_df["_datum_sort"] = pd.to_datetime(
+                csv_df["datum"], errors="coerce"
+            )
+            csv_df["_reihenfolge_alt"] = pd.to_numeric(
+                csv_df["reihenfolge"], errors="coerce"
+            ).fillna(9999)
+
             csv_df = csv_df.sort_values(
-                by=["kw", "fahrer_name", "reihenfolge"],
+                by=[
+                    "kw", "fahrer_name", "_datum_sort",
+                    "_reihenfolge_alt"
+                ],
                 kind="stable"
             )
+            csv_df["reihenfolge"] = (
+                csv_df.groupby(["kw", "fahrer_key"]).cumcount() + 1
+            )
+            csv_df = csv_df.drop(
+                columns=["_datum_sort", "_reihenfolge_alt"]
+            )
+
             csv_df.to_csv(
                 csv_path,
                 sep=";",
