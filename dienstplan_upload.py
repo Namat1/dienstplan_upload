@@ -7,6 +7,7 @@ import os
 import time
 import ftplib
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP, FTP_TLS, error_perm
 from dotenv import load_dotenv
@@ -32,8 +33,15 @@ wochentage_deutsch_map = {
     "Sunday": "Sonntag"
 }
 
-def get_kw(datum):
-    return datum.isocalendar()[1]
+def get_plan_kw(start_sonntag):
+    """Kalenderwoche der Planwoche Sonntag bis Samstag.
+
+    Maßgeblich ist der Montag innerhalb dieser Planwoche. Dadurch wird
+    der Jahreswechsel korrekt behandelt: 28.12.2025 bis 03.01.2026
+    gehört zur Kalenderwoche 01/2026 und nicht zu Kalenderwoche 53.
+    """
+    montag = pd.Timestamp(start_sonntag) + pd.Timedelta(days=1)
+    return int(montag.isocalendar().week)
 
 def _new_ftp():
     """Eine frische, eingeloggte FTP(S)-Verbindung im Passive-Mode."""
@@ -64,11 +72,14 @@ def ensure_ftp_dirs(ftp, remote_dir, created_cache):
         created_cache.add(path_built)
     created_cache.add(remote_dir)
 
-def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
-    # Dateien sammeln
+def upload_folder_to_ftp_with_progress(local_dir, ftp_dir, allowed_names=None):
+    # Dateien sammeln. Optional nur die ausdrücklich freigegebenen Dateien
+    # hochladen, damit lokale Hilfs- und ZIP-Dateien nicht auf dem Server landen.
     all_files = []
     for root, _, files in os.walk(local_dir):
         for file in files:
+            if allowed_names is not None and file not in allowed_names:
+                continue
             local_path = os.path.join(root, file)
             rel_path = os.path.relpath(local_path, local_dir).replace("\\", "/")
             remote_path = os.path.join(ftp_dir, rel_path).replace("\\", "/")
@@ -164,14 +175,221 @@ def upload_folder_to_ftp_with_progress(local_dir, ftp_dir):
             f"({workers} parallele Verbindungen, Ø {dauer / total:.2f}s/Datei)."
         )
 
+
+CSV_COLUMNS = [
+    "kw", "fahrer_key", "fahrer_name", "datum", "wochentag",
+    "uhrzeit", "tour", "reihenfolge", "url",
+]
+
+
+def download_existing_csv_from_ftp(local_path):
+    """Vorhandene dienstplaene.csv vom Zielordner laden.
+
+    Rückgabe: (status, meldung)
+    status ist "found", "missing" oder "error".
+    """
+    ftp = None
+    try:
+        ftp = _new_ftp()
+        remote_dir = (FTP_BASE_DIR or "/").replace("\\", "/")
+        if remote_dir and remote_dir != "/":
+            ftp.cwd(remote_dir)
+
+        with open(local_path, "wb") as handle:
+            ftp.retrbinary("RETR dienstplaene.csv", handle.write)
+
+        if not os.path.isfile(local_path) or os.path.getsize(local_path) == 0:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+            return "missing", "Die vorhandene dienstplaene.csv ist leer oder nicht vorhanden."
+
+        return "found", "Vorhandene dienstplaene.csv wurde vom FTP-Server geladen."
+
+    except error_perm as exc:
+        # 550 bedeutet bei FTP in der Regel: Datei oder Ordner nicht vorhanden.
+        if str(exc).lstrip().startswith("550"):
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except OSError:
+                pass
+            return "missing", "Auf dem FTP-Server wurde noch keine dienstplaene.csv gefunden."
+        return "error", f"FTP-Zugriffsfehler beim Laden der vorhandenen CSV: {exc}"
+    except Exception as exc:
+        return "error", f"Vorhandene CSV konnte nicht vom FTP-Server geladen werden: {exc}"
+    finally:
+        if ftp is not None:
+            try:
+                ftp.quit()
+            except (*ftplib.all_errors, OSError):
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+
+
+def read_dienstplan_csv(path):
+    """Dienstplan-CSV robust lesen und auf das erwartete Schema bringen."""
+    last_error = None
+    dataframe = None
+
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            dataframe = pd.read_csv(
+                path,
+                sep=";",
+                dtype=str,
+                encoding=encoding,
+                keep_default_na=False,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+
+    if dataframe is None:
+        raise ValueError(f"Vorhandene dienstplaene.csv ist nicht lesbar: {last_error}")
+
+    dataframe.columns = [str(column).lstrip("\ufeff").strip() for column in dataframe.columns]
+
+    required = {"kw", "fahrer_key", "fahrer_name", "datum", "uhrzeit", "tour"}
+    missing = sorted(required.difference(dataframe.columns))
+    if missing:
+        raise ValueError(
+            "Vorhandene dienstplaene.csv hat nicht das erwartete Format. "
+            f"Fehlende Spalten: {', '.join(missing)}"
+        )
+
+    for column in CSV_COLUMNS:
+        if column not in dataframe.columns:
+            dataframe[column] = ""
+
+    return dataframe[CSV_COLUMNS].copy()
+
+
+def week_start_sunday_from_dates(values):
+    """Sonntag der jeweiligen Planwoche für Datumswerte ermitteln."""
+    dates = pd.to_datetime(values, errors="coerce")
+    weekday = dates.dt.weekday
+    return dates - pd.to_timedelta((weekday + 1) % 7, unit="D")
+
+
+def clean_and_sort_csv(dataframe):
+    """Doppelte/überflüssige Zeilen entfernen und Reihenfolgen neu bilden."""
+    if dataframe.empty:
+        return pd.DataFrame(columns=CSV_COLUMNS)
+
+    dataframe = dataframe.copy()
+    for column in CSV_COLUMNS:
+        if column not in dataframe.columns:
+            dataframe[column] = ""
+    dataframe = dataframe[CSV_COLUMNS]
+
+    dataframe["kw"] = pd.to_numeric(dataframe["kw"], errors="coerce")
+    dataframe = dataframe.loc[dataframe["kw"].notna()].copy()
+    dataframe["kw"] = dataframe["kw"].astype(int)
+
+    dataframe = dataframe.drop_duplicates(
+        subset=[
+            "kw", "fahrer_key", "fahrer_name", "datum",
+            "wochentag", "uhrzeit", "tour"
+        ],
+        keep="first",
+    ).copy()
+
+    ist_leer = (
+        dataframe["uhrzeit"].astype(str).str.strip().isin(["", "–"])
+        & dataframe["tour"].astype(str).str.strip().isin(["", "–"])
+    )
+    hat_echten_eintrag = (~ist_leer).groupby([
+        dataframe["kw"],
+        dataframe["fahrer_key"],
+        dataframe["datum"],
+    ]).transform("any")
+    dataframe = dataframe.loc[~(ist_leer & hat_echten_eintrag)].copy()
+
+    dataframe["_datum_sort"] = pd.to_datetime(dataframe["datum"], errors="coerce")
+    dataframe["_wochenstart"] = week_start_sunday_from_dates(dataframe["datum"])
+    dataframe["_reihenfolge_alt"] = pd.to_numeric(
+        dataframe["reihenfolge"], errors="coerce"
+    ).fillna(9999)
+
+    dataframe = dataframe.sort_values(
+        by=[
+            "_wochenstart", "fahrer_name", "_datum_sort",
+            "_reihenfolge_alt"
+        ],
+        kind="stable",
+    )
+    dataframe["reihenfolge"] = (
+        dataframe.groupby(["_wochenstart", "fahrer_key"], dropna=False).cumcount() + 1
+    )
+    dataframe = dataframe.drop(
+        columns=["_datum_sort", "_wochenstart", "_reihenfolge_alt"]
+    )
+
+    return dataframe[CSV_COLUMNS]
+
+
+def merge_uploaded_weeks(existing_df, new_df, uploaded_week_starts):
+    """Nur die neu hochgeladenen Sonntag-bis-Samstag-Wochen ersetzen."""
+    if existing_df is None or existing_df.empty:
+        return clean_and_sort_csv(new_df), 0, 0
+
+    existing_df = existing_df.copy()
+    existing_dates = pd.to_datetime(existing_df["datum"], errors="coerce").dt.normalize()
+    replace_mask = pd.Series(False, index=existing_df.index)
+
+    for week_start in sorted(uploaded_week_starts):
+        start = pd.Timestamp(week_start).normalize()
+        end = start + pd.Timedelta(days=6)
+        replace_mask |= existing_dates.between(start, end, inclusive="both")
+
+    removed = int(replace_mask.sum())
+    retained_df = existing_df.loc[~replace_mask].copy()
+    retained = len(retained_df)
+
+    merged = pd.concat([retained_df, new_df], ignore_index=True)
+    return clean_and_sort_csv(merged), retained, removed
+
+
 def normalize_driver_name(nachname, vorname):
-    nachname = str(nachname).strip().title() if pd.notna(nachname) else ""
-    vorname = str(vorname).strip().title() if pd.notna(vorname) else ""
+    """Fahrernamen bereinigen; leere Excel-Zellen können als 0/0.0 erscheinen."""
+    def clean_part(value):
+        if pd.isna(value):
+            return ""
 
-    if not nachname and not vorname:
-        return ""
+        value_str = str(value).strip()
+        value_lower = value_str.lower()
 
-    return f"{nachname}, {vorname}".strip().strip(",")
+        if value_lower in {"", "nan", "none", "null", "nat", "-", "–"}:
+            return ""
+        if re.fullmatch(r"0+(?:[.,]0+)?", value_str):
+            return ""
+
+        return value_str.title()
+
+    nachname = clean_part(nachname)
+    vorname = clean_part(vorname)
+
+    # Bekannte Schreibvarianten aus unterschiedlichen Excel-Dateien
+    # auf eine einheitliche Fahreridentität zusammenführen.
+    alias = {
+        ("khalleefah", ""): ("Khalleefah", "Saed Awami Sayid"),
+        ("alem", "mohamed"): ("Alem", "Mohammed"),
+        ("maghraoui", "zakaria"): ("Maghraoui", "Zakariae"),
+    }.get((nachname.casefold(), vorname.casefold()))
+    if alias:
+        nachname, vorname = alias
+
+    if nachname and vorname:
+        return f"{nachname}, {vorname}"
+    if nachname:
+        return nachname
+    if vorname:
+        return vorname
+    return ""
 
 def parse_uhrzeit(uhrzeit):
     if pd.isna(uhrzeit):
@@ -203,7 +421,7 @@ def parse_tour(tour):
     return tour_str
 
 def generate_shared_html(css_styles):
-    """Erzeugt genau eine gemeinsame HTML-Datei, die ihre Daten aus CSV lädt."""
+    """Erzeugt eine CSP-konforme HTML-Datei ohne eingebettetes JavaScript."""
     template = r'''<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -218,7 +436,7 @@ def generate_shared_html(css_styles):
 <body>
 <div class="container-outer">
   <div class="back-bar">
-    <a href="plane.php" class="btn-back" id="btnBack">
+    <a href="../../../plane.php" class="btn-back" id="btnBack">
       <span class="btn-back-arrow" aria-hidden="true">‹</span>
       <span>Zurück</span>
     </a>
@@ -247,8 +465,16 @@ def generate_shared_html(css_styles):
 </div>
 <div class="browser-safe-spacer" aria-hidden="true"></div>
 
-<script>
-(function () {
+<script src="dienstplan_app.js?v=2" defer></script>
+<script src="../../../dienstplan.js" defer></script>
+</body>
+</html>'''
+    return template.replace("__CSS_STYLES__", css_styles)
+
+
+def generate_shared_js():
+    """JavaScript der gemeinsamen Dienstplanseite als externe Datei."""
+    return r'''(function () {
   "use strict";
 
   const params = new URLSearchParams(window.location.search);
@@ -459,11 +685,7 @@ def generate_shared_html(css_styles):
       showMessage("Fehler beim Laden", error.message);
     });
 })();
-</script>
-<script src="dienstplan.js"></script>
-</body>
-</html>'''
-    return template.replace("__CSS_STYLES__", css_styles)
+'''
 
 
 css_styles = """
@@ -945,7 +1167,9 @@ if uploaded_files:
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, "gesamt_export.zip")
             html_path = os.path.join(tmpdir, "dienstplan.html")
+            js_path = os.path.join(tmpdir, "dienstplan_app.js")
             csv_path = os.path.join(tmpdir, "dienstplaene.csv")
+            existing_csv_path = os.path.join(tmpdir, "dienstplaene_vorhanden.csv")
 
             ausschluss_stichwoerter = [
                 "zippel",
@@ -966,11 +1190,16 @@ if uploaded_files:
                 ("schulz", "stephan"): "STSchulz",
                 ("lewandowski", "kamil"): "Lewandowski",
                 ("lewandowski", "dominik"): "DLewandowski",
+                # Zwei verschiedene Fahrer mit gleichem Nachnamen:
+                # Rene behält aus Kompatibilitätsgründen den bisherigen Schlüssel.
+                ("schlutt", "rene"): "Schlutt",
+                ("schlutt", "hubert"): "HSchlutt",
             }
 
             csv_rows = []
             bekannte_zeilen = set()
             fahrer_wochen = set()
+            hochgeladene_wochen = set()
 
             for file in uploaded_files:
                 fahrer_df = pd.read_excel(file, sheet_name="a Fahrer", engine="openpyxl")
@@ -1025,7 +1254,8 @@ if uploaded_files:
                 global_start_sonntag = global_start_datum - pd.Timedelta(
                     days=(global_start_datum.weekday() + 1) % 7
                 )
-                global_kw = get_kw(global_start_sonntag) + 1
+                global_kw = get_plan_kw(global_start_sonntag)
+                hochgeladene_wochen.add(pd.Timestamp(global_start_sonntag).date())
 
                 fahrer_dict = dict(sorted(fahrer_dict.items(), key=lambda x: x[0].lower()))
 
@@ -1035,7 +1265,7 @@ if uploaded_files:
                         start_sonntag = start_datum - pd.Timedelta(
                             days=(start_datum.weekday() + 1) % 7
                         )
-                        kw = get_kw(start_sonntag) + 1
+                        kw = get_plan_kw(start_sonntag)
                     else:
                         start_sonntag = global_start_sonntag
                         kw = global_kw
@@ -1124,11 +1354,55 @@ if uploaded_files:
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(generate_shared_html(css_styles))
 
-            csv_df = pd.DataFrame(csv_rows)
-            csv_df = csv_df.sort_values(
-                by=["kw", "fahrer_name", "reihenfolge"],
-                kind="stable"
+            with open(js_path, "w", encoding="utf-8") as f:
+                f.write(generate_shared_js())
+
+            new_csv_df = clean_and_sort_csv(pd.DataFrame(csv_rows))
+
+            existing_csv_df = None
+            retained_rows = 0
+            replaced_rows = 0
+            merge_status = "missing"
+
+            if all([FTP_HOST, FTP_USER, FTP_PASS]):
+                merge_status, merge_message = download_existing_csv_from_ftp(existing_csv_path)
+
+                if merge_status == "found":
+                    try:
+                        existing_csv_df = read_dienstplan_csv(existing_csv_path)
+                    except Exception as exc:
+                        st.error(str(exc))
+                        st.error(
+                            "Der Vorgang wurde aus Sicherheitsgründen abgebrochen, "
+                            "damit keine vorhandenen Kalenderwochen überschrieben werden."
+                        )
+                        st.stop()
+                    st.info(
+                        f"Vorhandene CSV geladen: {len(existing_csv_df):,} Zeilen."
+                        .replace(",", ".")
+                    )
+                elif merge_status == "missing":
+                    st.info(merge_message + " Es wird eine neue Gesamtdatei angelegt.")
+                else:
+                    st.error(merge_message)
+                    st.error(
+                        "Der Vorgang wurde aus Sicherheitsgründen abgebrochen, "
+                        "damit die bestehende CSV nicht versehentlich ersetzt wird."
+                    )
+                    st.stop()
+            else:
+                st.warning(
+                    "FTP-Zugangsdaten fehlen. Die vorhandene dienstplaene.csv kann "
+                    "nicht eingelesen werden; der Download enthält daher nur die "
+                    "gerade hochgeladenen Wochen."
+                )
+
+            csv_df, retained_rows, replaced_rows = merge_uploaded_weeks(
+                existing_csv_df,
+                new_csv_df,
+                hochgeladene_wochen,
             )
+
             csv_df.to_csv(
                 csv_path,
                 sep=";",
@@ -1139,6 +1413,7 @@ if uploaded_files:
 
             with ZipFile(zip_path, "w") as zipf:
                 zipf.write(html_path, arcname="dienstplan.html")
+                zipf.write(js_path, arcname="dienstplan_app.js")
                 zipf.write(csv_path, arcname="dienstplaene.csv")
 
             with open(zip_path, "rb") as f:
@@ -1149,13 +1424,38 @@ if uploaded_files:
                     st.warning("FTP-Zugangsdaten fehlen in .env")
                 else:
                     st.info("Starte FTP-Upload ...")
-                    upload_folder_to_ftp_with_progress(tmpdir, FTP_BASE_DIR)
+                    upload_folder_to_ftp_with_progress(
+                        tmpdir,
+                        FTP_BASE_DIR,
+                        allowed_names={
+                            "dienstplan.html",
+                            "dienstplan_app.js",
+                            "dienstplaene.csv",
+                        },
+                    )
 
+            wochen_text = ", ".join(
+                pd.Timestamp(woche).strftime("%d.%m.%Y")
+                for woche in sorted(hochgeladene_wochen)
+            )
             st.success(
                 f"{len(uploaded_files)} Datei(en) verarbeitet. "
-                f"Eine HTML-Datei, eine CSV-Datei und "
-                f"{len(fahrer_wochen)} Fahrer-Woche(n) erstellt."
+                f"{len(fahrer_wochen)} Fahrer-Woche(n) neu erstellt. "
+                f"Die Gesamt-CSV enthält jetzt {len(csv_df):,} Zeilen."
+                .replace(",", ".")
             )
+
+            if existing_csv_df is not None:
+                st.info(
+                    f"Ersetzte Planwoche(n), jeweils ab Sonntag: {wochen_text}. "
+                    f"{replaced_rows:,} alte Zeilen wurden ersetzt und "
+                    f"{retained_rows:,} Zeilen aus anderen Wochen beibehalten."
+                    .replace(",", ".")
+                )
+            else:
+                st.info(
+                    f"Erzeugte Planwoche(n), jeweils ab Sonntag: {wochen_text}."
+                )
 
             st.info(
                 "Aufruf künftig zum Beispiel: "
@@ -1163,7 +1463,7 @@ if uploaded_files:
             )
 
             st.download_button(
-                "ZIP mit HTML- und CSV-Datei herunterladen",
+                "ZIP mit HTML-, JavaScript- und CSV-Datei herunterladen",
                 data=zip_bytes,
                 file_name="gesamt_export.zip",
                 mime="application/zip"
